@@ -1,0 +1,17 @@
+# Secrets
+credentials.env
+
+# Local storage backups (contain sensitive data)
+typingmind-localstorage-backup-*.json
+
+# Cursor IDE
+.cursor/
+
+# SpecStory
+.specstory/
+
+# Playwright MCP
+.playwright-mcp/
+
+# Node
+node_modules/
