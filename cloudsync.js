@@ -4865,7 +4865,7 @@ async download(key, isMetadata = false) {
 
       try {
         const manifest = await this.storageService.download(manifestKey, true);
-        if (!manifest || manifest.format !== "server-side") {
+        if (!manifest || (manifest.format !== "server-side" && manifest.format !== "export-style")) {
           throw new Error("Invalid server-side backup manifest");
         }
 
