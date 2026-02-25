@@ -28,6 +28,13 @@ if (window.typingMindCloudSync) {
 } else {
   window.typingMindCloudSync = true;
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // UTILITY: retryAsync
+  // Generic async retry wrapper with exponential backoff. Used throughout
+  // the storage provider and sync layers to gracefully handle transient
+  // network errors. Caller can pass isRetryable() to control which errors
+  // trigger a retry vs. an immediate throw.
+  // ─────────────────────────────────────────────────────────────────────────
   /**
    * A generic async retry utility with exponential backoff.
    * @param {Function} operation - The async function to execute.
@@ -64,6 +71,13 @@ if (window.typingMindCloudSync) {
     throw lastError;
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // CLASS: ConfigManager
+  // Loads, saves, and validates all extension settings from localStorage
+  // (bucket name, region, credentials, encryption key, sync interval, etc.).
+  // Also maintains the exclusion list -- keys that must never be synced.
+  // Key methods: loadConfig(), save(), shouldExclude(), reloadExclusions()
+  // ─────────────────────────────────────────────────────────────────────────
   class ConfigManager {
     constructor() {
       this.PEPPER = "tcs-v3-pepper-!@#$%^&*()";
@@ -238,6 +252,13 @@ if (window.typingMindCloudSync) {
       this.exclusions = this.loadExclusions();
     }
   }
+  // ─────────────────────────────────────────────────────────────────────────
+  // CLASS: Logger
+  // Structured console logging with typed entries (info, warning, error,
+  // success, start, skip). Optionally loads the Eruda mobile devtools
+  // overlay when the ?log=true URL param is present.
+  // Key methods: log(), setEnabled(), loadEruda(), destroyEruda()
+  // ─────────────────────────────────────────────────────────────────────────
   class Logger {
     constructor() {
       const urlParams = new URLSearchParams(window.location.search);
@@ -303,13 +324,24 @@ if (window.typingMindCloudSync) {
     }
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // CLASS: DataService
+  // Single source of truth for reading and writing TypingMind browser data.
+  // Covers both IndexedDB (chats, large objects stored as "idb" type) and
+  // localStorage (settings, prompts, agents stored as "ls" type), plus
+  // binary blob attachments. Also owns the tombstone system: soft-delete
+  // markers that track which items were deleted so deletions propagate
+  // across devices during sync.
+  // Key methods: getAllItems(), getAllItemsEfficient(), getItem(), saveItem(),
+  //   performDelete(), createTombstone(), getAllTombstones(), estimateDataSize()
+  // ─────────────────────────────────────────────────────────────────────────
   class DataService {
     constructor(configManager, logger, operationQueue = null) {
       this.config = configManager;
       this.logger = logger;
       this.operationQueue = operationQueue;
       this.dbPromise = null;
-      this.streamBatchSize = 1000;
+      this.streamBatchSize = 200;
       this.memoryThreshold = 100 * 1024 * 1024;
       this.throttleDelay = 10;
     }
@@ -342,13 +374,8 @@ if (window.typingMindCloudSync) {
               value !== undefined &&
               !this.config.shouldExclude(key)
             ) {
-              try {
-                const itemSize = JSON.stringify(value).length * 2;
-                totalSize += itemSize;
-                itemCount++;
-              } catch (e) {
-                this.logger.log("warning", `Error estimating size for ${key}`);
-              }
+              totalSize += this.estimateItemSize(value);
+              itemCount++;
             } else if (typeof key === "string") {
               excludedItemCount++;
             }
@@ -445,143 +472,87 @@ if (window.typingMindCloudSync) {
     }
     streamYield = null;
     async *streamAllItemsInternal() {
-      const batchSize = this.streamBatchSize;
-      let batch = [];
-      let batchSize_bytes = 0;
-      let db = null;
-      let transaction = null;
-      let pendingBatches = [];
-      let currentBatchIndex = 0;
+      const pageSize = this.streamBatchSize;
+      let idbProcessed = 0;
       try {
-        const processItem = (item) => {
-          try {
-            const estimatedSize = this.estimateItemSize(item.data);
-            if (
-              batchSize_bytes + estimatedSize > this.memoryThreshold &&
-              batch.length > 0
-            ) {
-              const currentBatch = [...batch];
-              batch = [item];
-              batchSize_bytes = estimatedSize;
-              return currentBatch;
-            }
-            batch.push(item);
-            batchSize_bytes += estimatedSize;
-            if (batch.length >= batchSize) {
-              const currentBatch = [...batch];
-              batch = [];
-              batchSize_bytes = 0;
-              return currentBatch;
-            }
-            return null;
-          } catch (error) {
-            this.logger.log(
-              "warning",
-              `Error processing item: ${error.message}`
-            );
-            return null;
-          }
-        };
-        db = await this.getDB();
-        transaction = db.transaction(["keyval"], "readonly");
-        const store = transaction.objectStore("keyval");
-        let idbProcessed = 0;
-        await new Promise((resolve, reject) => {
-          const request = store.openCursor();
-          request.onsuccess = async (event) => {
-            try {
-              const cursor = event.target.result;
-              if (cursor) {
-                const key = cursor.key;
-                const value = cursor.value;
-                if (value instanceof Blob) {
-                  const item = {
-                    id:   key,
-                    data: value,                 
-                    type: "blob",
-                    blobType: value.type,
-                    size: value.size,
-                  };
-                  const batchToYield = processItem(item);
-                  if (batchToYield) pendingBatches.push(batchToYield);
-                  cursor.continue();
-                  return;
-                }
+        const db = await this.getDB();
+        let lastKey = undefined;
+        let hasMore = true;
 
-                if (
-                  typeof key === "string" &&
-                  value !== undefined &&
-                  !this.config.shouldExclude(key)
-                ) {
-                  const item = { id: key, data: value, type: "idb" };
-                  const batchToYield = processItem(item);
-                  if (batchToYield) {
-                    pendingBatches.push(batchToYield);
-                    if (pendingBatches.length >= 10) {
-                      this.logger.log(
-                        "warning",
-                        `Large number of pending batches (${pendingBatches.length}), potential memory issue`
-                      );
-                    }
-                  }
-                  idbProcessed++;
-                  if (idbProcessed % 5000 === 0) {
-                    this.logger.log(
-                      "info",
-                      `Processed ${idbProcessed} IndexedDB items`
-                    );
-                  }
-                }
-                cursor.continue();
-              } else {
-                resolve();
+        while (hasMore) {
+          const page = await new Promise((resolve, reject) => {
+            const tx = db.transaction(["keyval"], "readonly");
+            const store = tx.objectStore("keyval");
+            const range = lastKey !== undefined
+              ? IDBKeyRange.lowerBound(lastKey, true)
+              : undefined;
+            const items = [];
+            const request = store.openCursor(range);
+            request.onsuccess = (event) => {
+              const cursor = event.target.result;
+              if (!cursor || items.length >= pageSize) {
+                resolve(items);
+                return;
               }
-            } catch (error) {
+              const key = cursor.key;
+              const value = cursor.value;
+              if (value instanceof Blob) {
+                items.push({
+                  id: key,
+                  data: value,
+                  type: "blob",
+                  blobType: value.type,
+                  size: value.size,
+                });
+              } else if (
+                typeof key === "string" &&
+                value !== undefined &&
+                !this.config.shouldExclude(key)
+              ) {
+                items.push({ id: key, data: value, type: "idb" });
+              }
+              cursor.continue();
+            };
+            request.onerror = () => reject(request.error);
+          });
+
+          if (page.length === 0) {
+            hasMore = false;
+          } else {
+            lastKey = page[page.length - 1].id;
+            idbProcessed += page.length;
+            if (idbProcessed % 2000 === 0) {
               this.logger.log(
-                "error",
-                `Error in cursor processing: ${error.message}`
+                "info",
+                `Processed ${idbProcessed} IndexedDB items`
               );
-              reject(error);
             }
-          };
-          request.onerror = () => {
-            this.logger.log("error", "IndexedDB cursor error");
-            reject(request.error);
-          };
-        });
-        for (let i = 0; i < pendingBatches.length; i++) {
-          yield pendingBatches[i];
-          pendingBatches[i] = null;
-          currentBatchIndex = i + 1;
-          if (i % 5 === 0) {
+            yield page;
             await this.forceGarbageCollection();
+            if (page.length < pageSize) {
+              hasMore = false;
+            }
           }
         }
-        pendingBatches = null;
-        let lsProcessed = 0;
+
+        let lsBatch = [];
         for (let i = 0; i < localStorage.length; i++) {
           const key = localStorage.key(i);
           if (key && !this.config.shouldExclude(key)) {
             const value = localStorage.getItem(key);
             if (value !== null) {
-              const item = { id: key, data: { key, value }, type: "ls" };
-              const batchToYield = processItem(item);
-              if (batchToYield) {
-                yield batchToYield;
+              lsBatch.push({ id: key, data: { key, value }, type: "ls" });
+              if (lsBatch.length >= pageSize) {
+                yield lsBatch;
+                lsBatch = [];
                 await this.forceGarbageCollection();
-              }
-              lsProcessed++;
-              if (lsProcessed % 1000 === 0) {
-                this.logger.log(
-                  "info",
-                  `Processed ${lsProcessed} localStorage items`
-                );
               }
             }
           }
         }
-        if (batch && batch.length > 0) {
-          yield batch;
+        if (lsBatch.length > 0) {
+          yield lsBatch;
+          lsBatch = null;
           await this.forceGarbageCollection();
         }
       } catch (error) {
@@ -590,21 +561,6 @@ if (window.typingMindCloudSync) {
           `Error in streamAllItemsInternal: ${error.message}`
         );
         throw error;
-      } finally {
-        try {
-          if (pendingBatches) {
-            for (let i = currentBatchIndex; i < pendingBatches.length; i++) {
-              pendingBatches[i] = null;
-            }
-            pendingBatches = null;
-          }
-          batch = null;
-          transaction = null;
-          db = null;
-          await this.forceGarbageCollection();
-        } catch (cleanupError) {
-          this.logger.log("warning", `Cleanup error: ${cleanupError.message}`);
-        }
       }
     }
     async getAllItemsEfficient() {
@@ -1012,6 +968,15 @@ if (window.typingMindCloudSync) {
     }
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // CLASS: CryptoService
+  // Client-side AES-256-GCM encryption and decryption for all data before
+  // it leaves the browser. Derives a CryptoKey from the user's passphrase
+  // using PBKDF2 (SHA-256, 100k iterations) and caches it per session.
+  // Each encrypted payload is: [12-byte random IV] + [AES-GCM ciphertext].
+  // Also handles streaming JSON compression for large arrays.
+  // Key methods: encrypt(), decrypt(), encryptBytes(), decryptBytes(), deriveKey()
+  // ─────────────────────────────────────────────────────────────────────────
   class CryptoService {
     constructor(configManager, logger) {
       this.config = configManager;
@@ -1216,6 +1181,15 @@ if (window.typingMindCloudSync) {
       }
     }
   }
+  // ─────────────────────────────────────────────────────────────────────────
+  // CLASS: IStorageProvider  (abstract base)
+  // Defines the interface that all cloud storage backends must implement.
+  // Concrete subclasses (S3Service, GoogleDriveService) override every method.
+  // The constructor throws if instantiated directly, enforcing the contract.
+  // Interface: isConfigured(), initialize(), handleAuthentication(),
+  //   upload(), download(), delete(), list(), downloadWithResponse(),
+  //   copyObject(), ensurePathExists()
+  // ─────────────────────────────────────────────────────────────────────────
   class IStorageProvider {
     constructor(configManager, cryptoService, logger) {
       if (this.constructor === IStorageProvider) {
@@ -1306,6 +1280,16 @@ if (window.typingMindCloudSync) {
     }
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // CLASS: S3Service  (extends IStorageProvider)
+  // Storage backend for AWS S3 and any S3-compatible provider (Cloudflare R2,
+  // Wasabi, iDrive E2, GCS S3 API, etc.). Dynamically loads the AWS SDK v3
+  // from CDN on first use. Uses multipart upload for large files and server-
+  // side copy (CopyObject) for fast snapshot creation without re-uploading.
+  // Encrypts all data via CryptoService before uploading; decrypts on download.
+  // Key methods: upload(), download(), downloadRaw(), delete(), list(),
+  //   copyObject(), uploadRaw(), loadSDK()
+  // ─────────────────────────────────────────────────────────────────────────
   class S3Service extends IStorageProvider {
     constructor(configManager, cryptoService, logger) {
       super(configManager, cryptoService, logger);
@@ -1769,6 +1753,16 @@ async download(key, isMetadata = false) {
     }
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // CLASS: GoogleDriveService  (extends IStorageProvider)
+  // Storage backend for Google Drive using the GAPI and Google Identity
+  // Services (GIS) OAuth2 libraries, loaded dynamically from CDN.
+  // Data lives in a hidden app-specific Drive folder (appDataFolder scope).
+  // Folder paths are emulated via nested Drive folder hierarchies; each file
+  // is looked up by path on every operation (results are cached per session).
+  // Key methods: handleAuthentication(), upload(), download(), delete(),
+  //   list(), copyObject(), _getPathId(), _getAppFolderId()
+  // ─────────────────────────────────────────────────────────────────────────
   class GoogleDriveService extends IStorageProvider {
     constructor(configManager, cryptoService, logger) {
       super(configManager, cryptoService, logger);
@@ -2604,6 +2598,21 @@ async download(key, isMetadata = false) {
     }
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // CLASS: SyncOrchestrator
+  // The core sync engine. Owns the local metadata index (items map with
+  // timestamps/fingerprints) and drives all sync flows:
+  //  - performFullSync(): entry point called on page load and on schedule.
+  //    Runs syncFromCloud() first, then syncToCloud() or createInitialSync().
+  //  - syncFromCloud(): downloads items newer in cloud than local.
+  //  - syncToCloud(): uploads items newer locally than in cloud.
+  //  - createInitialSync(): first-time upload when cloud is empty.
+  //  - initializeLocalMetadata(): rebuilds the local index on a new device.
+  //  - forceImportFromCloud(): destructive overwrite of local with cloud data.
+  //  - forceExportToCloud(): destructive overwrite of cloud with local data.
+  //  - restoreFromBackup(): restores a named snapshot from the backups/ folder.
+  // Also handles tombstone cleanup and chat fingerprinting for change detection.
+  // ─────────────────────────────────────────────────────────────────────────
   class SyncOrchestrator {
     constructor(
       configManager,
@@ -2711,7 +2720,6 @@ async download(key, isMetadata = false) {
       );
       this.logger.log("info", `Found ${localItemKeys.size} local item keys.`);
 
-      const { totalSize } = await this.dataService.estimateDataSize();
       const itemsIterator = this.dataService.streamAllItemsInternal();
 
       for await (const batch of itemsIterator) {
@@ -3403,17 +3411,9 @@ async download(key, isMetadata = false) {
         "start",
         "🔧 Initializing local metadata from database contents"
       );
-      const { totalSize } = await this.dataService.estimateDataSize();
-      const useStreaming = totalSize > this.dataService.memoryThreshold;
       const tombstones = this.dataService.getAllTombstones();
       let itemCount = 0;
       let tombstoneCount = 0;
-      this.logger.log(
-        "info",
-        `Using memory-efficient metadata initialization (dataset: ${this.dataService.formatSize(
-          totalSize
-        )})`
-      );
 
       for await (const batch of this.dataService.streamAllItemsInternal()) {
         for (const item of batch) {
@@ -3673,17 +3673,14 @@ async download(key, isMetadata = false) {
     }
     async getSyncDiagnostics() {
       try {
-        const { totalSize, itemCount, excludedItemCount } =
-          await this.dataService.estimateDataSize();
-        const localCount = itemCount;
+        const localItemKeys = await this.dataService.getAllItemKeys();
+        const localCount = localItemKeys.size;
         let chatItems = 0;
-        for await (const batch of this.dataService.streamAllItemsInternal()) {
-          for (const item of batch) {
-            if (item.id.startsWith("CHAT_")) {
-              chatItems++;
-            }
-          }
+        let excludedItemCount = 0;
+        for (const key of localItemKeys) {
+          if (key.startsWith("CHAT_")) chatItems++;
         }
+        const totalKeysInDB = localCount + excludedItemCount;
 
         const metadataCount = Object.keys(this.metadata.items || {}).length;
         const metadataDeleted = Object.values(this.metadata.items || {}).filter(
@@ -3755,16 +3752,11 @@ async download(key, isMetadata = false) {
       }
       localStorage.setItem("tcs_sync_diag_last_update", String(_now));
       try {
-        const { totalSize, itemCount, excludedItemCount } =
-          await this.dataService.estimateDataSize();
-        const localCount = itemCount;
+        const localItemKeys = await this.dataService.getAllItemKeys();
+        const localCount = localItemKeys.size;
         let chatItems = 0;
-        for await (const batch of this.dataService.streamAllItemsInternal()) {
-          for (const item of batch) {
-            if (item.id.startsWith("CHAT_")) {
-              chatItems++;
-            }
-          }
+        for (const key of localItemKeys) {
+          if (key.startsWith("CHAT_")) chatItems++;
         }
         const metadataCount = Object.keys(this.metadata.items || {}).length;
         const metadataDeleted = Object.values(this.metadata.items || {}).filter(
@@ -3787,7 +3779,7 @@ async download(key, isMetadata = false) {
           cloudMetadata: cloudActive,
           chatSyncLocal: chatItems,
           chatSyncCloud: cloudChatItems,
-          excludedItemCount: excludedItemCount,
+          excludedItemCount: 0,
         };
         localStorage.setItem(
           "tcs_sync_diagnostics",
@@ -4012,6 +4004,17 @@ async download(key, isMetadata = false) {
     }
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // CLASS: BackupService
+  // Manages named snapshots and automated daily backups stored under the
+  // backups/ prefix in cloud storage. Snapshots are created via server-side
+  // copy (no re-upload) and tracked in a manifest-index.json file.
+  // Daily backups run automatically once per UTC day with a 30-minute
+  // cooldown; they are pruned after 30 days. Manual snapshots are kept
+  // indefinitely until the user deletes them.
+  // Key methods: createSnapshot(), runDailyBackupIfNeeded(),
+  //   listBackups(), deleteBackup()
+  // ─────────────────────────────────────────────────────────────────────────
   class BackupService {
     constructor(dataService, storageService, logger) {
       this.dataService = dataService;
@@ -5090,6 +5093,15 @@ async download(key, isMetadata = false) {
     }
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // CLASS: OperationQueue
+  // A serialized async task queue that prevents concurrent writes to the
+  // same item key. Operations are keyed by item ID so multiple pending
+  // writes to the same key coalesce. Includes automatic retry (up to
+  // maxRetries) and queue size limiting to prevent unbounded growth.
+  // Used by DataService to safely serialize IndexedDB writes during sync.
+  // Key methods: enqueue(), processQueue()
+  // ─────────────────────────────────────────────────────────────────────────
   class OperationQueue {
     constructor(logger) {
       this.logger = logger;
@@ -5215,6 +5227,15 @@ async download(key, isMetadata = false) {
     }
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // CLASS: LeaderElection
+  // Ensures only one browser tab performs cloud sync at a time when the user
+  // has multiple TypingMind tabs open. Uses the BroadcastChannel API to
+  // coordinate tab identity and leadership. The elected leader tab calls
+  // CloudSyncApp.runLeaderTasks() which triggers performFullSync() and starts
+  // the auto-sync interval. Non-leader tabs listen passively for updates.
+  // Key methods: elect(), onLeaderElected(), cleanup()
+  // ─────────────────────────────────────────────────────────────────────────
   class LeaderElection {
     constructor(channelName, logger) {
       this.channelName = channelName;
@@ -5432,6 +5453,21 @@ async download(key, isMetadata = false) {
     }
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // CLASS: CloudSyncApp  (main application entry point)
+  // Wires together all services (ConfigManager, Logger, DataService,
+  // CryptoService, storage provider, SyncOrchestrator, BackupService,
+  // OperationQueue, LeaderElection) and manages the full application lifecycle.
+  //
+  // Also owns the entire UI layer: the Sync modal (config, diagnostics,
+  // backup list, tombstone/recycle-bin panel) injected into the TypingMind
+  // sidebar. The modal is built as a plain HTML string and wired up with
+  // event listeners after insertion into the DOM.
+  //
+  // Key methods: initialize(), runLeaderTasks(), startAutoSync(),
+  //   createModal(), getModalHTML(), openModal(), updateSyncStatus(),
+  //   registerProvider(), forceImportFromCloud(), forceExportToCloud()
+  // ─────────────────────────────────────────────────────────────────────────
   class CloudSyncApp {
     constructor() {
       this.footerHTML =
@@ -7292,6 +7328,20 @@ async loadTombstoneList(modal) {
   app.registerProvider("s3", S3Service);
   app.registerProvider("googleDrive", GoogleDriveService);
   app.initialize();
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // GLOBAL EXPORTS & DEBUG UTILITIES
+  // Exposes the live app instance and a set of console-callable debug helpers
+  // on the window object. These are useful for diagnosing sync issues directly
+  // from the browser DevTools console without opening the UI:
+  //   window.cloudSyncApp        - the live CloudSyncApp instance
+  //   window.createTombstone()   - manually mark an item as deleted
+  //   window.getTombstones()     - list all current soft-delete tombstones
+  //   window.getMemoryStats()    - report estimated data sizes
+  //   window.estimateBackupSize()- calculate total cloud storage used
+  //   window.getMemoryDiagnostics() - detailed heap and storage diagnostics
+  //   window.forceMemoryCleanup()   - trigger GC and clear caches
+  // ─────────────────────────────────────────────────────────────────────────
   window.cloudSyncApp = app;
   const cleanupHandler = () => {
     try {
