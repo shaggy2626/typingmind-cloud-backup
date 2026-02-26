@@ -2852,6 +2852,7 @@ async download(key, isMetadata = false) {
       }
 
       for (const [itemId, metadata] of Object.entries(this.metadata.items)) {
+        if (itemId.startsWith("tcs_tombstone_")) continue;
         if (metadata.deleted && metadata.deleted > (metadata.synced || 0)) {
           if (
             !changedItems.some(
@@ -2875,6 +2876,7 @@ async download(key, isMetadata = false) {
       );
       let newlyDeletedCount = 0;
       for (const itemId in this.metadata.items) {
+        if (itemId.startsWith("tcs_tombstone_")) continue;
         const metadataItem = this.metadata.items[itemId];
 
         if (!localItemKeys.has(itemId) && !metadataItem.deleted) {
