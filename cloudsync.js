@@ -2636,7 +2636,16 @@ async download(key, isMetadata = false) {
       return result;
     }
     saveMetadata() {
-      localStorage.setItem("tcs_local-metadata", JSON.stringify(this.metadata));
+      const compacted = {
+        ...this.metadata,
+        items: {},
+      };
+      for (const [key, item] of Object.entries(this.metadata.items || {})) {
+        if (!item.deleted) {
+          compacted.items[key] = item;
+        }
+      }
+      localStorage.setItem("tcs_local-metadata", JSON.stringify(compacted));
     }
     getLastCloudSync() {
       const stored = localStorage.getItem("tcs_last-cloud-sync");
@@ -3391,27 +3400,36 @@ async download(key, isMetadata = false) {
           localStorage.setItem("tcs_metadata_etag", "");
       }
 
-      const cloudMetadata = await this.getCloudMetadata();
-      const localMetadataEmpty =
-        Object.keys(this.metadata.items || {}).length === 0;
-      const cloudMetadataEmpty =
-        Object.keys(cloudMetadata.items || {}).length === 0;
-      if (cloudMetadataEmpty) {
-        const { itemCount } = await this.dataService.estimateDataSize();
-        if (itemCount > 0) {
-          this.logger.log(
-            "info",
-            `🚀 Fresh cloud setup detected: ${itemCount} local items found with empty cloud metadata. Triggering initial sync.`
-          );
-          await this.createInitialSync();
-        } else {
-          this.logger.log(
-            "info",
-            "Fresh setup with no local data - nothing to sync"
-          );
-        }
+      const restorePending = localStorage.getItem("tcs_restore_pending");
+      if (restorePending === "true") {
+        this.logger.log(
+          "info",
+          "🛡️ Post-restore mode: skipping syncToCloud to prevent metadata corruption. Download-only sync complete."
+        );
+        localStorage.removeItem("tcs_restore_pending");
       } else {
-        await this.syncToCloud();
+        const cloudMetadata = await this.getCloudMetadata();
+        const localMetadataEmpty =
+          Object.keys(this.metadata.items || {}).length === 0;
+        const cloudMetadataEmpty =
+          Object.keys(cloudMetadata.items || {}).length === 0;
+        if (cloudMetadataEmpty) {
+          const { itemCount } = await this.dataService.estimateDataSize();
+          if (itemCount > 0) {
+            this.logger.log(
+              "info",
+              `🚀 Fresh cloud setup detected: ${itemCount} local items found with empty cloud metadata. Triggering initial sync.`
+            );
+            await this.createInitialSync();
+          } else {
+            this.logger.log(
+              "info",
+              "Fresh setup with no local data - nothing to sync"
+            );
+          }
+        } else {
+          await this.syncToCloud();
+        }
       }
       const now = Date.now();
       const lastCleanup = localStorage.getItem("tcs_last-tombstone-cleanup");
@@ -4978,15 +4996,32 @@ async download(key, isMetadata = false) {
           }
         }
 
+        const restoredCloudMetadata = await this.storageService.download(
+          "metadata.json",
+          true
+        );
+
+        let tombstonesStripped = 0;
+        for (const [key, item] of Object.entries(restoredCloudMetadata.items || {})) {
+          if (item.deleted) {
+            delete restoredCloudMetadata.items[key];
+            tombstonesStripped++;
+          }
+        }
+        if (tombstonesStripped > 0) {
+          restoredCloudMetadata.lastSync = Date.now();
+          await this.storageService.upload("metadata.json", restoredCloudMetadata, true);
+          this.logger.log(
+            "info",
+            `🧹 Stripped ${tombstonesStripped} tombstones from restored metadata and re-uploaded clean version`
+          );
+        }
+
         this.logger.log(
           "start",
           "🧹 Starting local data reconciliation post-restore..."
         );
 
-        const restoredCloudMetadata = await this.storageService.download(
-          "metadata.json",
-          true
-        );
         const validCloudKeys = new Set(
           Object.keys(restoredCloudMetadata.items || {})
         );
@@ -5036,6 +5071,7 @@ async download(key, isMetadata = false) {
         localStorage.removeItem("tcs_local-metadata");
         localStorage.removeItem("tcs_last-cloud-sync");
         localStorage.removeItem("tcs_metadata_etag");
+        localStorage.setItem("tcs_restore_pending", "true");
 
         this.logger.log(
           "success",
@@ -5043,7 +5079,7 @@ async download(key, isMetadata = false) {
         );
         this.logger.log(
           "success",
-          "Page will reload in 3 seconds to sync restored data."
+          "Page will reload in 3 seconds to sync restored data (download-only mode)."
         );
 
         setTimeout(() => {
