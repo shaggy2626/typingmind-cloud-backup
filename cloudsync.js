@@ -3173,6 +3173,7 @@ async download(key, isMetadata = false) {
         const DOWNLOAD_CONCURRENCY = 15;
         let downloadedCount = 0;
         let downloadFailCount = 0;
+        const failedKeys = new Set();
         for (let i = 0; i < itemsToDownload.length; i += DOWNLOAD_CONCURRENCY) {
           const batch = itemsToDownload.slice(i, i + DOWNLOAD_CONCURRENCY);
           const batchPromises = batch.map(
@@ -3212,6 +3213,7 @@ async download(key, isMetadata = false) {
                 downloadedCount++;
               } catch (dlErr) {
                 downloadFailCount++;
+                failedKeys.add(key);
                 this.logger.log("warning", `Failed to download "${key}": ${dlErr.message}`);
               }
             }
@@ -3223,6 +3225,15 @@ async download(key, isMetadata = false) {
               `Cloud download progress: ${downloadedCount}/${itemsToDownload.length} done` +
                 (downloadFailCount > 0 ? `, ${downloadFailCount} failed` : "")
             );
+          }
+        }
+        if (failedKeys.size > 0) {
+          this.logger.log(
+            "warning",
+            `⚠️ ${failedKeys.size} items failed to download and will be retried on next sync`
+          );
+          for (const fk of failedKeys) {
+            delete cloudMetadata.items[fk];
           }
         }
         this.metadata = cloudMetadata;
