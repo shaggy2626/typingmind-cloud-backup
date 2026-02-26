@@ -332,6 +332,21 @@ if (window.typingMindCloudSync) {
   // binary blob attachments. Also owns the tombstone system: soft-delete
   // markers that track which items were deleted so deletions propagate
   // across devices during sync.
+  function detectMimeFromBytes(data) {
+    let bytes = null;
+    if (data instanceof Uint8Array) bytes = data;
+    else if (data instanceof ArrayBuffer) bytes = new Uint8Array(data);
+    else if (data instanceof Blob) return data.type || "application/octet-stream";
+    if (!bytes || bytes.length < 4) return "application/octet-stream";
+    if (bytes[0]===0x89 && bytes[1]===0x50 && bytes[2]===0x4E && bytes[3]===0x47) return "image/png";
+    if (bytes[0]===0xFF && bytes[1]===0xD8 && bytes[2]===0xFF) return "image/jpeg";
+    if (bytes[0]===0x47 && bytes[1]===0x49 && bytes[2]===0x46) return "image/gif";
+    if (bytes[0]===0x52 && bytes[1]===0x49 && bytes[2]===0x46 && bytes[3]===0x46
+      && bytes.length>=12 && bytes[8]===0x57 && bytes[9]===0x45 && bytes[10]===0x42 && bytes[11]===0x50) return "image/webp";
+    if (bytes[0]===0x25 && bytes[1]===0x50 && bytes[2]===0x44 && bytes[3]===0x46) return "application/pdf";
+    return "application/octet-stream";
+  }
+
   // Key methods: getAllItems(), getAllItemsEfficient(), getItem(), saveItem(),
   //   performDelete(), createTombstone(), getAllTombstones(), estimateDataSize()
   // ─────────────────────────────────────────────────────────────────────────
@@ -767,9 +782,11 @@ if (window.typingMindCloudSync) {
           return false;
         }
       } else if (type === "blob") {
-        const blob = new Blob([item], {
-          type: item.blobType || "application/octet-stream",
-        });
+        let mimeType = item.blobType || "application/octet-stream";
+        if (mimeType === "application/octet-stream") {
+          mimeType = detectMimeFromBytes(item);
+        }
+        const blob = new Blob([item], { type: mimeType });
         return this.saveItem(blob, "idb", itemKey);
       }
       return false;
@@ -3958,7 +3975,13 @@ async download(key, isMetadata = false) {
               type: item.type,
             };
             if (item.type === "blob") {
-              metadataEntry.blobType = item.blobType || (item.data instanceof Blob ? item.data.type : "");
+              let detectedMime = item.blobType || (item.data instanceof Blob ? item.data.type : "");
+              if (!detectedMime || detectedMime === "application/octet-stream") {
+                detectedMime = item.data instanceof Blob
+                  ? await item.data.arrayBuffer().then(ab => detectMimeFromBytes(new Uint8Array(ab))).catch(() => "application/octet-stream")
+                  : detectMimeFromBytes(item.data);
+              }
+              metadataEntry.blobType = detectedMime;
               metadataEntry.size = item.size || (item.data instanceof Blob ? item.data.size : 0);
               metadataEntry.lastModified = now;
             } else if (
@@ -4325,7 +4348,13 @@ async download(key, isMetadata = false) {
               type: item.type,
             };
             if (item.type === "blob") {
-              metadataEntry.blobType = item.blobType || (item.data instanceof Blob ? item.data.type : "");
+              let detectedMime = item.blobType || (item.data instanceof Blob ? item.data.type : "");
+              if (!detectedMime || detectedMime === "application/octet-stream") {
+                detectedMime = item.data instanceof Blob
+                  ? await item.data.arrayBuffer().then(ab => detectMimeFromBytes(new Uint8Array(ab))).catch(() => "application/octet-stream")
+                  : detectMimeFromBytes(item.data);
+              }
+              metadataEntry.blobType = detectedMime;
               metadataEntry.size = item.size || (item.data instanceof Blob ? item.data.size : 0);
               metadataEntry.lastModified = now;
             } else if (
@@ -4758,7 +4787,13 @@ async download(key, isMetadata = false) {
               type: item.type,
             };
             if (item.type === "blob") {
-              metadataEntry.blobType = item.blobType || (item.data instanceof Blob ? item.data.type : "");
+              let detectedMime = item.blobType || (item.data instanceof Blob ? item.data.type : "");
+              if (!detectedMime || detectedMime === "application/octet-stream") {
+                detectedMime = item.data instanceof Blob
+                  ? await item.data.arrayBuffer().then(ab => detectMimeFromBytes(new Uint8Array(ab))).catch(() => "application/octet-stream")
+                  : detectMimeFromBytes(item.data);
+              }
+              metadataEntry.blobType = detectedMime;
               metadataEntry.size = item.size || (item.data instanceof Blob ? item.data.size : 0);
               metadataEntry.lastModified = now;
             } else if (
