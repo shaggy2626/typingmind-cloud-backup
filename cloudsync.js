@@ -2911,7 +2911,8 @@ async download(key, isMetadata = false) {
         const cloudMetadata = await this.getCloudMetadata();
         let itemsSynced = 0;
 
-        const uploadPromises = changedItems.map(async (item) => {
+        const UPLOAD_CONCURRENCY = 5;
+        const processOneUpload = async (item) => {
           const cloudItem = cloudMetadata.items[item.id];
           if (
             cloudItem &&
@@ -2947,9 +2948,9 @@ async download(key, isMetadata = false) {
               const mime = (item.type === 'blob' && data instanceof Blob)
                 ? data.type
                 : (item.blobType || '');
-             if (item.type === "blob" && data instanceof Blob) {
-  data = new Uint8Array(await data.arrayBuffer());
-}
+              if (item.type === "blob" && data instanceof Blob) {
+                data = new Uint8Array(await data.arrayBuffer());
+              }
               if (data) {
                 const path =
                   item.type === "blob"
@@ -2991,11 +2992,17 @@ async download(key, isMetadata = false) {
               "error",
               `Failed to sync key "${item.id}": ${error.message}`
             );
-            throw error;
           }
-        });
+        };
 
-        await Promise.allSettled(uploadPromises);
+        for (let ui = 0; ui < changedItems.length; ui += UPLOAD_CONCURRENCY) {
+          const uploadBatch = changedItems.slice(ui, ui + UPLOAD_CONCURRENCY);
+          await Promise.allSettled(uploadBatch.map(processOneUpload));
+          if (ui + UPLOAD_CONCURRENCY < changedItems.length) {
+            this.logger.log("info", `Cloud upload progress: ${Math.min(ui + UPLOAD_CONCURRENCY, changedItems.length)}/${changedItems.length} done`);
+            await new Promise(r => setTimeout(r, 500));
+          }
+        }
 
         if (itemsSynced > 0) {
           cloudMetadata.lastSync = Date.now();
@@ -3289,50 +3296,58 @@ async download(key, isMetadata = false) {
         const now = Date.now();
 
         for await (const batch of allItemsIterator) {
-          const uploadPromises = batch.map(async (item) => {
-            if (item.deleted || item.reason === "tombstone") {
-              const tombstoneData = {
-                deleted: item.deleted || now,
-                deletedAt: item.deleted || now,
-                type: item.type,
-                tombstoneVersion: item.tombstoneVersion || 1,
-                synced: now,
-              };
-              return {
-                id: item.id,
-                metadata: tombstoneData,
-                isTombstone: true,
-              };
-            } else {
-              await this.storageService.upload(
-                `items/${item.id}.json`,
-                item.data,
-                false,
-                item.id
-              );
-              const newMetadataEntry = {
-                synced: now,
-                type: item.type,
-              };
-
-              if (
-                item.id.startsWith("CHAT_") &&
-                item.type === "idb" &&
-                item.data?.updatedAt
-              ) {
-                newMetadataEntry.lastModified = item.data.updatedAt;
-                newMetadataEntry.chatFingerprint = this.getChatFingerprint(item.data);
+          const CHUNK = 5;
+          const allResults = [];
+          for (let ci = 0; ci < batch.length; ci += CHUNK) {
+            const chunk = batch.slice(ci, ci + CHUNK);
+            const uploadPromises = chunk.map(async (item) => {
+              if (item.deleted || item.reason === "tombstone") {
+                const tombstoneData = {
+                  deleted: item.deleted || now,
+                  deletedAt: item.deleted || now,
+                  type: item.type,
+                  tombstoneVersion: item.tombstoneVersion || 1,
+                  synced: now,
+                };
+                return {
+                  id: item.id,
+                  metadata: tombstoneData,
+                  isTombstone: true,
+                };
               } else {
-                newMetadataEntry.size = this.getItemSize(item.data);
-                newMetadataEntry.lastModified = now;
+                await this.storageService.upload(
+                  `items/${item.id}.json`,
+                  item.data,
+                  false,
+                  item.id
+                );
+                const newMetadataEntry = {
+                  synced: now,
+                  type: item.type,
+                };
+
+                if (
+                  item.id.startsWith("CHAT_") &&
+                  item.type === "idb" &&
+                  item.data?.updatedAt
+                ) {
+                  newMetadataEntry.lastModified = item.data.updatedAt;
+                  newMetadataEntry.chatFingerprint = this.getChatFingerprint(item.data);
+                } else {
+                  newMetadataEntry.size = this.getItemSize(item.data);
+                  newMetadataEntry.lastModified = now;
+                }
+                return { id: item.id, metadata: newMetadataEntry };
               }
-              return { id: item.id, metadata: newMetadataEntry };
+            });
+            const chunkResults = await Promise.allSettled(uploadPromises);
+            allResults.push(...chunkResults);
+            if (ci + CHUNK < batch.length) {
+              await new Promise(r => setTimeout(r, 300));
             }
-          });
+          }
 
-          const results = await Promise.allSettled(uploadPromises);
-
-          results.forEach((result) => {
+          allResults.forEach((result) => {
             if (result.status === "fulfilled" && result.value) {
               const { id, metadata, isTombstone } = result.value;
               this.metadata.items[id] = metadata;
@@ -3878,26 +3893,33 @@ async download(key, isMetadata = false) {
         let uploadedCount = 0;
         let skippedTombstones = 0;
         for await (const batch of this.dataService.streamAllItemsInternal()) {
-          const uploadPromises = batch.map(async (item) => {
-            if (item.id.startsWith("tcs_tombstone_")) {
-              skippedTombstones++;
-              return;
+          const CHUNK = 5;
+          for (let ci = 0; ci < batch.length; ci += CHUNK) {
+            const chunk = batch.slice(ci, ci + CHUNK);
+            const uploadPromises = chunk.map(async (item) => {
+              if (item.id.startsWith("tcs_tombstone_")) {
+                skippedTombstones++;
+                return;
+              }
+              if (item.type === "blob" && item.data instanceof Blob) {
+                const arrayBuf = await item.data.arrayBuffer();
+                const uint8 = new Uint8Array(arrayBuf);
+                await this.storageService.upload(
+                  `attachments/${item.id}.bin`,
+                  uint8
+                );
+              } else {
+                await this.storageService.upload(
+                  `items/${item.id}.json`,
+                  item.data
+                );
+              }
+            });
+            await Promise.allSettled(uploadPromises);
+            if (ci + CHUNK < batch.length) {
+              await new Promise(r => setTimeout(r, 300));
             }
-            if (item.type === "blob" && item.data instanceof Blob) {
-              const arrayBuf = await item.data.arrayBuffer();
-              const uint8 = new Uint8Array(arrayBuf);
-              await this.storageService.upload(
-                `attachments/${item.id}.bin`,
-                uint8
-              );
-            } else {
-              await this.storageService.upload(
-                `items/${item.id}.json`,
-                item.data
-              );
-            }
-          });
-          await Promise.allSettled(uploadPromises);
+          }
           uploadedCount += batch.length;
           this.logger.log(
             "info",
@@ -4261,22 +4283,31 @@ async download(key, isMetadata = false) {
         for await (const batch of this.dataService.streamAllItemsInternal()) {
           totalItems += batch.length;
 
-          const uploadPromises = batch.map(async (item) => {
-            if (item.id.startsWith("tcs_tombstone_")) return;
-            if (item.type === "blob" && item.data instanceof Blob) {
-              const arrayBuf = await item.data.arrayBuffer();
-              const uint8 = new Uint8Array(arrayBuf);
-              await this.storageService.upload(
-                `${backupFolder}/attachments/${item.id}.bin`,
-                uint8
-              );
-            } else {
-              const key = `${backupFolder}/items/${item.id}.json`;
-              await this.storageService.upload(key, item.data);
+          const CHUNK = 5;
+          const allResults = [];
+          for (let ci = 0; ci < batch.length; ci += CHUNK) {
+            const chunk = batch.slice(ci, ci + CHUNK);
+            const uploadPromises = chunk.map(async (item) => {
+              if (item.id.startsWith("tcs_tombstone_")) return;
+              if (item.type === "blob" && item.data instanceof Blob) {
+                const arrayBuf = await item.data.arrayBuffer();
+                const uint8 = new Uint8Array(arrayBuf);
+                await this.storageService.upload(
+                  `${backupFolder}/attachments/${item.id}.bin`,
+                  uint8
+                );
+              } else {
+                const key = `${backupFolder}/items/${item.id}.json`;
+                await this.storageService.upload(key, item.data);
+              }
+            });
+            const chunkResults = await Promise.allSettled(uploadPromises);
+            allResults.push(...chunkResults);
+            if (ci + CHUNK < batch.length) {
+              await new Promise(r => setTimeout(r, 300));
             }
-          });
-          const results = await Promise.allSettled(uploadPromises);
-          uploadedItems += results.filter((r) => r.status === "fulfilled").length;
+          }
+          uploadedItems += allResults.filter((r) => r.status === "fulfilled").length;
 
           if (uploadedItems % 200 === 0) {
             this.logger.log(
@@ -4672,12 +4703,12 @@ async download(key, isMetadata = false) {
         );
 
         let uploadedItems = 0;
-        const concurrency = 20;
+        const CHUNK = 5;
 
         for await (const batch of this.dataService.streamAllItemsInternal()) {
-          for (let i = 0; i < batch.length; i += concurrency) {
-            const slice = batch.slice(i, i + concurrency);
-            const uploadPromises = slice.map(async (item) => {
+          for (let ci = 0; ci < batch.length; ci += CHUNK) {
+            const chunk = batch.slice(ci, ci + CHUNK);
+            const uploadPromises = chunk.map(async (item) => {
               if (item.id.startsWith("tcs_tombstone_")) return true;
               if (item.type === "blob" && item.data instanceof Blob) {
                 const arrayBuf = await item.data.arrayBuffer();
@@ -4693,7 +4724,10 @@ async download(key, isMetadata = false) {
               return true;
             });
             await Promise.allSettled(uploadPromises);
-            uploadedItems += slice.length;
+            uploadedItems += chunk.length;
+            if (ci + CHUNK < batch.length) {
+              await new Promise(r => setTimeout(r, 300));
+            }
           }
 
           if (uploadedItems % 200 === 0) {
