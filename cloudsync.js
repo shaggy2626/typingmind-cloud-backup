@@ -2761,6 +2761,9 @@ async download(key, isMetadata = false) {
           ) {
             continue;
           }
+          if (key.startsWith("tcs_tombstone_")) {
+            continue;
+          }
 
           const value = item.data;
           const existingItem = this.metadata.items[key];
