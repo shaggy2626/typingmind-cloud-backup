@@ -4,14 +4,11 @@ credentials.env
 # Local storage backups (contain sensitive data)
 typingmind-localstorage-backup-*.json
 
-# Cursor IDE
+# Personal files
+jg-stuff/
+
+# IDE / tool folders
 .cursor/
-
-# SpecStory
 .specstory/
-
-# Playwright MCP
-.playwright-mcp/
-
-# Node
-node_modules/
+.cursorignore
+.cursorindexingignore

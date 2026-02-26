@@ -3170,43 +3170,61 @@ async download(key, isMetadata = false) {
             `Processing ${itemsToDownload.length} items from cloud`
           );
         }
-        const downloadPromises = itemsToDownload.map(
-          async ([key, cloudItem]) => {
-            if (cloudItem.deleted) {
-              this.logger.log(
-                "info",
-                `🗑️ Processing cloud tombstone for key "${key}" (v${
-                  cloudItem.tombstoneVersion || 1
-                })`
-              );
-              await this.dataService.performDelete(key, cloudItem.type);
-              const tombstoneData = {
-                deleted: cloudItem.deleted,
-                deletedAt: cloudItem.deletedAt || cloudItem.deleted,
-                type: cloudItem.type,
-                tombstoneVersion: cloudItem.tombstoneVersion || 1,
-              };
-              this.dataService.saveTombstoneToStorage(key, tombstoneData);
-            } else {
-              const path = cloudItem.type === "blob"
-                ? `attachments/${key}.bin`
-                : `items/${key}.json`;
-        
-              const data = await this.storageService.download(path);
-
-              if (data) {
-                if (cloudItem.type === "blob") {
-                  data.blobType = cloudItem.blobType || '';
-                  await this.dataService.saveItem(data, "blob", key);       
+        const DOWNLOAD_CONCURRENCY = 15;
+        let downloadedCount = 0;
+        let downloadFailCount = 0;
+        for (let i = 0; i < itemsToDownload.length; i += DOWNLOAD_CONCURRENCY) {
+          const batch = itemsToDownload.slice(i, i + DOWNLOAD_CONCURRENCY);
+          const batchPromises = batch.map(
+            async ([key, cloudItem]) => {
+              try {
+                if (cloudItem.deleted) {
+                  this.logger.log(
+                    "info",
+                    `🗑️ Processing cloud tombstone for key "${key}" (v${
+                      cloudItem.tombstoneVersion || 1
+                    })`
+                  );
+                  await this.dataService.performDelete(key, cloudItem.type);
+                  const tombstoneData = {
+                    deleted: cloudItem.deleted,
+                    deletedAt: cloudItem.deletedAt || cloudItem.deleted,
+                    type: cloudItem.type,
+                    tombstoneVersion: cloudItem.tombstoneVersion || 1,
+                  };
+                  this.dataService.saveTombstoneToStorage(key, tombstoneData);
                 } else {
-                  await this.dataService.saveItem(data, cloudItem.type, key);
+                  const path = cloudItem.type === "blob"
+                    ? `attachments/${key}.bin`
+                    : `items/${key}.json`;
+
+                  const data = await this.storageService.download(path);
+
+                  if (data) {
+                    if (cloudItem.type === "blob") {
+                      data.blobType = cloudItem.blobType || '';
+                      await this.dataService.saveItem(data, "blob", key);
+                    } else {
+                      await this.dataService.saveItem(data, cloudItem.type, key);
+                    }
+                  }
                 }
-                this.logger.log("info", `Synced key "${key}" from cloud`);
+                downloadedCount++;
+              } catch (dlErr) {
+                downloadFailCount++;
+                this.logger.log("warning", `Failed to download "${key}": ${dlErr.message}`);
               }
             }
+          );
+          await Promise.allSettled(batchPromises);
+          if (downloadedCount % 150 === 0 || i + DOWNLOAD_CONCURRENCY >= itemsToDownload.length) {
+            this.logger.log(
+              "info",
+              `Cloud download progress: ${downloadedCount}/${itemsToDownload.length} done` +
+                (downloadFailCount > 0 ? `, ${downloadFailCount} failed` : "")
+            );
           }
-        );
-        await Promise.allSettled(downloadPromises);
+        }
         this.metadata = cloudMetadata;
         this.metadata.lastSync = cloudLastSync;
         this.setLastCloudSync(cloudLastSync);
