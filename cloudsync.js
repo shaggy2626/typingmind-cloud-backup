@@ -21,12 +21,16 @@ Contributors (Docs & Fixes):
 - McQuade (Stability improvements) [2025-12-28]
 */
 
-const TCS_BUILD_VERSION = "2026-01-09.3";
+const TCS_BUILD_VERSION = "2026-03-06.1";
 
 if (window.typingMindCloudSync) {
   console.log("TypingMind Cloud Sync already loaded");
 } else {
   window.typingMindCloudSync = true;
+  try {
+    window.TCS_BUILD_VERSION = TCS_BUILD_VERSION;
+    console.log(`[TCS] Loaded build ${TCS_BUILD_VERSION}`);
+  } catch {}
 
   // ─────────────────────────────────────────────────────────────────────────
   // UTILITY: retryAsync
@@ -2789,6 +2793,11 @@ async download(key, isMetadata = false) {
         null
       );
     }
+
+    _getChatTimestampMs(chat) {
+      const raw = this._getChatTimestampRaw(chat);
+      return this._parseTimestampToMs(raw);
+    }
     collectArchiveTargetsForChatPayload(chatId, chat, allLocalKeys) {
       const uuidRegex =
         /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
@@ -2891,22 +2900,23 @@ async download(key, isMetadata = false) {
         allLocalKeysOverride || (await this.dataService.getAllItemKeys());
       return this.collectArchiveTargetsForChatPayload(chatId, chat, allLocalKeys);
     }
-    async listLocalChatsBeforeYear(cutoffYear) {
+    async listLocalChatsBeforeTimestamp(cutoffMs) {
       const chats = [];
+      const cutoff = Number(cutoffMs) || 0;
+      if (!cutoff) return chats;
+
       for await (const batch of this.dataService.streamAllItemsInternal()) {
         for (const item of batch) {
           if (!item?.id || item.type !== "idb") continue;
           if (!String(item.id).startsWith("CHAT_")) continue;
-          const updatedAtRaw = this._getChatTimestampRaw(item.data);
-          const updatedAtMs = this._parseTimestampToMs(updatedAtRaw);
-          if (!updatedAtMs) continue;
-          const year = new Date(updatedAtMs).getFullYear();
-          if (year < cutoffYear) {
+          const tsMs = this._getChatTimestampMs(item.data);
+          if (!tsMs) continue;
+          if (tsMs < cutoff) {
             chats.push({
               chatId: item.id,
               title: this._getChatTitle(item.data),
-              updatedAt: updatedAtRaw,
-              updatedAtMs,
+              updatedAt: this._getChatTimestampRaw(item.data),
+              updatedAtMs: tsMs,
             });
           }
         }
@@ -2914,7 +2924,15 @@ async download(key, isMetadata = false) {
       chats.sort((a, b) => (a.updatedAtMs || 0) - (b.updatedAtMs || 0));
       return chats;
     }
-    async previewArchiveBeforeYear(cutoffYear) {
+    async listLocalChatsBeforeYear(cutoffYear) {
+      const chats = [];
+      const y = Number(cutoffYear);
+      if (!y) return chats;
+      const cutoffMs = new Date(`${y}-01-01T00:00:00`).getTime();
+      return await this.listLocalChatsBeforeTimestamp(cutoffMs);
+    }
+
+    async previewArchiveBeforeTimestamp(cutoffMs) {
       const allLocalKeys = await this.dataService.getAllItemKeys();
       const manifest = this.loadLocalArchiveManifest();
       const alreadyArchived = new Set(Object.keys(manifest.chats || {}));
@@ -2927,6 +2945,23 @@ async download(key, isMetadata = false) {
       let totalChatCount = 0;
       let undatedChatCount = 0;
       const sampleChats = [];
+      const cutoff = Number(cutoffMs) || 0;
+      if (!cutoff) {
+        return {
+          cutoffMs: 0,
+          cutoffIso: "",
+          totalChatCount: 0,
+          undatedChatCount: 0,
+          candidateChatCount: 0,
+          archivableChatCount: 0,
+          totalKeysToRemove: 0,
+          blobCount: 0,
+          cacheCount: 0,
+          localBlobKeyCount: Array.from(allLocalKeys).filter((k) => String(k).startsWith("BLOB_")).length,
+          localClientCacheKeyCount: Array.from(allLocalKeys).filter((k) => String(k).startsWith("CLIENT_CACHE_attachment-")).length,
+          sampleChats: [],
+        };
+      }
 
       for await (const batch of this.dataService.streamAllItemsInternal()) {
         for (const item of batch) {
@@ -2934,20 +2969,18 @@ async download(key, isMetadata = false) {
           if (!String(item.id).startsWith("CHAT_")) continue;
           if (alreadyArchived.has(item.id)) continue;
           totalChatCount++;
-          const updatedAtRaw = this._getChatTimestampRaw(item.data);
-          const updatedAtMs = this._parseTimestampToMs(updatedAtRaw);
-          if (!updatedAtMs) {
+          const tsMs = this._getChatTimestampMs(item.data);
+          if (!tsMs) {
             undatedChatCount++;
             continue;
           }
-          const year = new Date(updatedAtMs).getFullYear();
-          if (year >= cutoffYear) continue;
+          if (tsMs >= cutoff) continue;
           candidateChatCount++;
           if (sampleChats.length < 20) {
             sampleChats.push({
               chatId: item.id,
               title: this._getChatTitle(item.data),
-              updatedAt: updatedAtRaw,
+              updatedAt: this._getChatTimestampRaw(item.data),
             });
           }
 
@@ -2967,7 +3000,8 @@ async download(key, isMetadata = false) {
       }
 
       return {
-        cutoffYear,
+        cutoffMs: cutoff,
+        cutoffIso: new Date(cutoff).toISOString(),
         totalChatCount,
         undatedChatCount,
         candidateChatCount,
@@ -2979,6 +3013,13 @@ async download(key, isMetadata = false) {
         localClientCacheKeyCount: Array.from(allLocalKeys).filter((k) => String(k).startsWith("CLIENT_CACHE_attachment-")).length,
         sampleChats,
       };
+    }
+    async previewArchiveBeforeYear(cutoffYear) {
+      const y = Number(cutoffYear);
+      if (!y) return await this.previewArchiveBeforeTimestamp(0);
+      const cutoffMs = new Date(`${y}-01-01T00:00:00`).getTime();
+      const res = await this.previewArchiveBeforeTimestamp(cutoffMs);
+      return { cutoffYear: y, ...res };
     }
     async previewArchiveAllChats() {
       const allLocalKeys = await this.dataService.getAllItemKeys();
@@ -3032,25 +3073,21 @@ async download(key, isMetadata = false) {
         sampleChats,
       };
     }
-    async archiveChatsBeforeYear(cutoffYear, { requireCloneVerified = true } = {}) {
+    async archiveChatsBeforeTimestamp(cutoffMs) {
       if (!this.storageService || !this.storageService.isConfigured()) {
         throw new Error("Cloud storage must be configured before archiving.");
       }
       if (this.syncInProgress) {
         throw new Error("Sync already in progress. Try again in a moment.");
       }
-      if (requireCloneVerified) {
-        const cloneVerified = localStorage.getItem("tcs_clone_verified") === "true";
-        if (!cloneVerified) {
-          throw new Error(
-            "Bulk archive is locked until you confirm the clone bucket is complete (toggle in UI)."
-          );
-        }
+      const cutoff = Number(cutoffMs) || 0;
+      if (!cutoff) {
+        throw new Error("Invalid cutoff date. Please pick a valid date.");
       }
 
       this.logger.log(
         "start",
-        `📦 Starting local-only archive for chats before ${cutoffYear}`
+        `📦 Starting local-only archive for chats before ${new Date(cutoff).toISOString()}`
       );
 
       // Safety: ensure cloud has the latest before pruning local.
@@ -3066,7 +3103,7 @@ async download(key, isMetadata = false) {
       const missingFromCloudByChat = [];
       const deletedKeys = new Set();
 
-      const candidates = await this.listLocalChatsBeforeYear(cutoffYear);
+      const candidates = await this.listLocalChatsBeforeTimestamp(cutoff);
       for (const candidate of candidates) {
         const chatId = candidate.chatId;
         if (alreadyArchived.has(chatId)) continue;
@@ -3101,7 +3138,8 @@ async download(key, isMetadata = false) {
           updatedAt: targets.updatedAt,
           keys: targets.keys,
           keySummary: targets.keySummary,
-          cutoffYear,
+          cutoffBeforeMs: cutoff,
+          cutoffBeforeIso: new Date(cutoff).toISOString(),
         };
 
         for (const key of targets.keys) {
@@ -3132,11 +3170,18 @@ async download(key, isMetadata = false) {
       });
 
       return {
-        cutoffYear,
+        cutoffMs: cutoff,
         archivedChats,
         skippedChats,
         missingFromCloudByChat,
       };
+    }
+    async archiveChatsBeforeYear(cutoffYear) {
+      const y = Number(cutoffYear);
+      if (!y) throw new Error("Invalid cutoff year");
+      const cutoffMs = new Date(`${y}-01-01T00:00:00`).getTime();
+      const res = await this.archiveChatsBeforeTimestamp(cutoffMs);
+      return { cutoffYear: y, ...res };
     }
     getArchivedChatsList() {
       const manifest = this.loadLocalArchiveManifest();
@@ -7022,12 +7067,13 @@ async download(key, isMetadata = false) {
              </div>
            </div>`
         : "";
-      const cloneVerified = localStorage.getItem("tcs_clone_verified") === "true";
+      const cutoffDateDefault =
+        localStorage.getItem("tcs_archive_cutoff_date") || "2024-01-01";
       return `<div class="text-white text-left text-sm">
         <!-- Modal Header (Fixed) -->
         <div class="cloud-sync-modal-header">
           <div class="flex justify-between items-center gap-3">
-            <h3 class="text-xl font-bold text-white">Cloud Sync</h3>
+            <h3 class="text-xl font-bold text-white">Cloud Sync <span class="text-xs font-normal text-zinc-400">(${TCS_BUILD_VERSION})</span></h3>
             <div class="flex items-center gap-2">
               <span class="text-sm text-zinc-400">Auto-Sync</span>
               <input type="checkbox" id="auto-sync-toggle" class="h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300 rounded cursor-pointer" ${this.autoSyncEnabled ? 'checked' : ''} ${this.noSyncMode ? 'disabled' : ''}>
@@ -7107,26 +7153,20 @@ async download(key, isMetadata = false) {
                 Archive removes chats/attachments from <strong>this browser</strong> only (cloud copies stay). You can restore later.
               </div>
 
-              <div class="flex items-center justify-between p-2 bg-zinc-900/40 rounded border border-zinc-700">
-                <div class="text-xs text-zinc-300">
-                  <div class="font-medium">Safety gate</div>
-                  <div class="text-zinc-400">Bulk archive is disabled until you confirm your S3 clone bucket finished.</div>
-                </div>
-                <label class="flex items-center gap-2 text-xs text-zinc-300">
-                  <span>Clone verified</span>
-                  <input type="checkbox" id="clone-verified-toggle" class="h-4 w-4" ${cloneVerified ? "checked" : ""}>
-                </label>
+              <div class="flex items-center justify-between">
+                <div class="text-sm text-zinc-200 font-medium">Archive chats before</div>
+                <div class="text-xs text-zinc-400" id="local-archive-current-count">Archived: 0</div>
               </div>
 
-              <div class="flex items-center justify-between">
-                <div class="text-sm text-zinc-200 font-medium">Archive chats before 2024</div>
-                <div class="text-xs text-zinc-400" id="local-archive-current-count">Archived: 0</div>
+              <div class="flex items-center justify-between gap-2">
+                <label class="text-xs text-zinc-400">Cutoff date</label>
+                <input id="archive-cutoff-date" type="date" value="${cutoffDateDefault}" class="px-2 py-1 border border-zinc-600 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 text-xs dark:bg-zinc-700 text-white">
               </div>
 
               <div class="flex items-center justify-between gap-2">
                 <label class="text-xs text-zinc-400">Preview scope</label>
                 <select id="archive-preview-scope" class="px-2 py-1 border border-zinc-600 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 text-xs dark:bg-zinc-700 text-white">
-                  <option value="before-2024" selected>Before 2024</option>
+                  <option value="cutoff" selected>Before cutoff date</option>
                   <option value="all">All chats (any year)</option>
                 </select>
               </div>
@@ -7865,25 +7905,17 @@ async download(key, isMetadata = false) {
       }
     }
 
-    getCloneVerified() {
-      return localStorage.getItem("tcs_clone_verified") === "true";
-    }
-    setCloneVerified(enabled) {
-      localStorage.setItem("tcs_clone_verified", enabled ? "true" : "false");
-    }
     updateLocalArchiveUIState(modal) {
       const previewBtn = modal.querySelector("#preview-archive-pre2024-btn");
       const archiveBtn = modal.querySelector("#archive-pre2024-btn");
       const restoreSelectedBtn = modal.querySelector("#restore-archived-selected-btn");
       const restoreAllBtn = modal.querySelector("#restore-archived-all-btn");
-      const cloneToggle = modal.querySelector("#clone-verified-toggle");
       const isConfigured = !!this.storageService?.isConfigured();
-      const cloneVerified = cloneToggle ? !!cloneToggle.checked : this.getCloneVerified();
       if (previewBtn) {
         previewBtn.disabled = false;
       }
       if (archiveBtn) {
-        archiveBtn.disabled = this.noSyncMode || !isConfigured || !cloneVerified;
+        archiveBtn.disabled = this.noSyncMode || !isConfigured;
       }
       if (restoreSelectedBtn) {
         const select = modal.querySelector("#archived-chats-select");
@@ -7900,9 +7932,15 @@ async download(key, isMetadata = false) {
       const select = modal.querySelector("#archived-chats-select");
       const restoreSelectedBtn = modal.querySelector("#restore-archived-selected-btn");
       const restoreAllBtn = modal.querySelector("#restore-archived-all-btn");
-      const cloneToggle = modal.querySelector("#clone-verified-toggle");
-      if (cloneToggle) {
-        cloneToggle.checked = this.getCloneVerified();
+      const cutoffDateInput = modal.querySelector("#archive-cutoff-date");
+      if (cutoffDateInput) {
+        const stored = localStorage.getItem("tcs_archive_cutoff_date");
+        if (stored && !cutoffDateInput.value) {
+          cutoffDateInput.value = stored;
+        }
+        if (cutoffDateInput.value) {
+          localStorage.setItem("tcs_archive_cutoff_date", cutoffDateInput.value);
+        }
       }
 
       const list = this.syncOrchestrator?.getArchivedChatsList?.() || [];
@@ -7913,16 +7951,28 @@ async download(key, isMetadata = false) {
         if (list.length === 0) {
           select.innerHTML = `<option value="">No archived chats</option>`;
         } else {
+          const parseToMs = (value) => {
+            if (typeof value === "number") {
+              return value < 10_000_000_000 ? value * 1000 : value;
+            }
+            if (!value) return 0;
+            const ms = new Date(value).getTime();
+            return Number.isFinite(ms) ? ms : 0;
+          };
           select.innerHTML =
             `<option value="">Select a chat…</option>` +
             list
               .map((c) => {
-                const title = (c.title || c.chatId).replace(/</g, "&lt;").replace(/>/g, "&gt;");
+                const title = (c.title || "").replace(/</g, "&lt;").replace(/>/g, "&gt;");
                 const archivedAt = c.archivedAt
                   ? new Date(c.archivedAt).toLocaleDateString()
                   : "";
+                const updatedAtMs = parseToMs(c.updatedAt);
+                const updatedAt = updatedAtMs ? new Date(updatedAtMs).toLocaleDateString() : "";
                 const suffix = c.keyCount ? ` (${c.keyCount} keys)` : "";
-                return `<option value="${c.chatId}">${archivedAt} — ${title}${suffix}</option>`;
+                const labelTitle = title || c.chatId;
+                const datePart = updatedAt ? `Last: ${updatedAt}` : (archivedAt ? `Archived: ${archivedAt}` : "");
+                return `<option value="${c.chatId}">${datePart} — ${labelTitle} — ${c.chatId}${suffix}</option>`;
               })
               .join("");
         }
@@ -7932,24 +7982,25 @@ async download(key, isMetadata = false) {
       this.updateLocalArchiveUIState(modal);
     }
     setupLocalArchiveHandlers(modal) {
-      const cloneToggle = modal.querySelector("#clone-verified-toggle");
       const previewBtn = modal.querySelector("#preview-archive-pre2024-btn");
       const archiveBtn = modal.querySelector("#archive-pre2024-btn");
       const previewOut = modal.querySelector("#local-archive-preview");
       const previewScope = modal.querySelector("#archive-preview-scope");
+      const cutoffDateInput = modal.querySelector("#archive-cutoff-date");
       const select = modal.querySelector("#archived-chats-select");
       const restoreSelectedBtn = modal.querySelector("#restore-archived-selected-btn");
       const restoreAllBtn = modal.querySelector("#restore-archived-all-btn");
       const restoreStatus = modal.querySelector("#local-archive-restore-status");
 
-      if (cloneToggle) {
-        const handler = (e) => {
-          this.setCloneVerified(!!e.target.checked);
-          this.updateLocalArchiveUIState(modal);
+      if (cutoffDateInput) {
+        const handler = () => {
+          if (cutoffDateInput.value) {
+            localStorage.setItem("tcs_archive_cutoff_date", cutoffDateInput.value);
+          }
         };
-        cloneToggle.addEventListener("change", handler);
+        cutoffDateInput.addEventListener("change", handler);
         this.modalCleanupCallbacks.push(() =>
-          cloneToggle.removeEventListener("change", handler)
+          cutoffDateInput.removeEventListener("change", handler)
         );
       }
 
@@ -7968,13 +8019,17 @@ async download(key, isMetadata = false) {
           previewBtn.textContent = "Working...";
           if (previewOut) previewOut.textContent = "Calculating…";
           try {
-            const scope = previewScope?.value || "before-2024";
+            const scope = previewScope?.value || "cutoff";
+            const dateStr = cutoffDateInput?.value || localStorage.getItem("tcs_archive_cutoff_date") || "";
+            const cutoffMs = dateStr ? new Date(`${dateStr}T00:00:00`).getTime() : 0;
             const result =
               scope === "all"
                 ? await this.syncOrchestrator.previewArchiveAllChats()
-                : await this.syncOrchestrator.previewArchiveBeforeYear(2024);
+                : await this.syncOrchestrator.previewArchiveBeforeTimestamp(cutoffMs);
             if (previewOut) {
-              const scopeLabel = scope === "all" ? "ALL chats" : "before 2024";
+              const scopeLabel = scope === "all"
+                ? "ALL chats"
+                : (dateStr ? `before ${dateStr}` : "before cutoff date");
               previewOut.textContent =
                 `Scope: ${scopeLabel}\n` +
                 `Chats (candidates): ${result.candidateChatCount}\n` +
@@ -8006,14 +8061,15 @@ async download(key, isMetadata = false) {
         const handler = async (e) => {
           e.stopPropagation();
           if (archiveBtn.disabled) return;
-          const cloneVerified = this.getCloneVerified();
-          if (!cloneVerified) {
-            alert("Bulk archive is locked until you confirm the clone bucket is complete.");
+          const dateStr = cutoffDateInput?.value || localStorage.getItem("tcs_archive_cutoff_date") || "";
+          const cutoffMs = dateStr ? new Date(`${dateStr}T00:00:00`).getTime() : 0;
+          if (!cutoffMs) {
+            alert("Please pick a cutoff date first.");
             return;
           }
           if (
             !confirm(
-              "Archive chats before 2024 from THIS BROWSER only?\n\n- Cloud copies remain intact.\n- This deletes chats + linked BLOB_ + CLIENT_CACHE_attachment-* locally.\n- You can restore later.\n\nThis will run a full sync first.\n\nContinue?"
+              `Archive chats before ${dateStr} from THIS BROWSER only?\n\n- Cloud copies remain intact.\n- This deletes chats + linked BLOB_ + CLIENT_CACHE_attachment-* locally.\n- You can restore later.\n\nThis will run a full sync first.\n\nContinue?`
             )
           ) {
             return;
@@ -8024,9 +8080,7 @@ async download(key, isMetadata = false) {
           if (previewOut) previewOut.textContent = "Archiving…";
           this.updateSyncStatus("syncing");
           try {
-            const result = await this.syncOrchestrator.archiveChatsBeforeYear(2024, {
-              requireCloneVerified: true,
-            });
+            const result = await this.syncOrchestrator.archiveChatsBeforeTimestamp(cutoffMs);
             if (previewOut) {
               previewOut.textContent =
                 `Archived chats: ${result.archivedChats.length}\n` +

@@ -5,6 +5,7 @@ credentials.env
 typingmind-localstorage-backup-*.json
 
 # Personal files
+temp_auto_push.bat
 jg-stuff/
 
 # IDE / tool folders
@@ -12,3 +13,5 @@ jg-stuff/
 .specstory/
 .cursorignore
 .cursorindexingignore
+.gitignore
+temp_interactive_push.bat
