@@ -2733,6 +2733,53 @@ async download(key, isMetadata = false) {
         ""
       );
     }
+    _getChatTimestampRaw(chat) {
+      // Prefer explicit chat-level timestamps when available.
+      const direct =
+        chat?.updatedAt ||
+        chat?.updated_at ||
+        chat?.lastUpdated ||
+        chat?.modifiedAt ||
+        chat?.createdAt ||
+        chat?.created_at ||
+        chat?.created ||
+        chat?.timestamp ||
+        chat?.ts ||
+        chat?.chat?.updatedAt ||
+        chat?.chat?.updated_at ||
+        chat?.chat?.createdAt ||
+        chat?.chat?.created_at ||
+        chat?.conversation?.updatedAt ||
+        chat?.conversation?.updated_at ||
+        chat?.conversation?.createdAt ||
+        chat?.conversation?.created_at ||
+        null;
+      if (direct) return direct;
+
+      // Fallback: last message timestamp (many older chats only have message timestamps)
+      const messages =
+        (Array.isArray(chat?.messages) && chat.messages) ||
+        (Array.isArray(chat?.chat?.messages) && chat.chat.messages) ||
+        (Array.isArray(chat?.conversation?.messages) && chat.conversation.messages) ||
+        (Array.isArray(chat?.data?.messages) && chat.data.messages) ||
+        null;
+      if (messages && messages.length > 0) {
+        const last = messages[messages.length - 1];
+        if (last && typeof last === "object") {
+          return (
+            last.updatedAt ||
+            last.updated_at ||
+            last.createdAt ||
+            last.created_at ||
+            last.timestamp ||
+            last.ts ||
+            null
+          );
+        }
+      }
+
+      return null;
+    }
     _getChatUpdatedAtRaw(chat) {
       return (
         chat?.updatedAt ||
@@ -2823,8 +2870,8 @@ async download(key, isMetadata = false) {
       return {
         chatId,
         title: this._getChatTitle(chat),
-        updatedAt: this._getChatUpdatedAtRaw(chat),
-        updatedAtMs: this._parseTimestampToMs(this._getChatUpdatedAtRaw(chat)),
+        updatedAt: this._getChatTimestampRaw(chat),
+        updatedAtMs: this._parseTimestampToMs(this._getChatTimestampRaw(chat)),
         uuids: Array.from(uuids),
         keys,
         keySummary: {
@@ -2850,7 +2897,7 @@ async download(key, isMetadata = false) {
         for (const item of batch) {
           if (!item?.id || item.type !== "idb") continue;
           if (!String(item.id).startsWith("CHAT_")) continue;
-          const updatedAtRaw = this._getChatUpdatedAtRaw(item.data);
+          const updatedAtRaw = this._getChatTimestampRaw(item.data);
           const updatedAtMs = this._parseTimestampToMs(updatedAtRaw);
           if (!updatedAtMs) continue;
           const year = new Date(updatedAtMs).getFullYear();
@@ -2869,33 +2916,47 @@ async download(key, isMetadata = false) {
     }
     async previewArchiveBeforeYear(cutoffYear) {
       const allLocalKeys = await this.dataService.getAllItemKeys();
-      const candidates = await this.listLocalChatsBeforeYear(cutoffYear);
       const manifest = this.loadLocalArchiveManifest();
       const alreadyArchived = new Set(Object.keys(manifest.chats || {}));
 
       const unionKeys = new Set();
       let blobCount = 0;
       let cacheCount = 0;
-      let chatCount = 0;
+      let archivableChatCount = 0;
+      let candidateChatCount = 0;
+      let totalChatCount = 0;
+      let undatedChatCount = 0;
+      const sampleChats = [];
 
-      // We need payloads to find attachments/caches; re-stream chats only.
       for await (const batch of this.dataService.streamAllItemsInternal()) {
         for (const item of batch) {
           if (!item?.id || item.type !== "idb") continue;
           if (!String(item.id).startsWith("CHAT_")) continue;
           if (alreadyArchived.has(item.id)) continue;
-          const updatedAtRaw = this._getChatUpdatedAtRaw(item.data);
+          totalChatCount++;
+          const updatedAtRaw = this._getChatTimestampRaw(item.data);
           const updatedAtMs = this._parseTimestampToMs(updatedAtRaw);
-          if (!updatedAtMs) continue;
+          if (!updatedAtMs) {
+            undatedChatCount++;
+            continue;
+          }
           const year = new Date(updatedAtMs).getFullYear();
           if (year >= cutoffYear) continue;
+          candidateChatCount++;
+          if (sampleChats.length < 20) {
+            sampleChats.push({
+              chatId: item.id,
+              title: this._getChatTitle(item.data),
+              updatedAt: updatedAtRaw,
+            });
+          }
 
           const targets = this.collectArchiveTargetsForChatPayload(
             item.id,
             item.data,
             allLocalKeys
           );
-          chatCount++;
+          archivableChatCount++;
           for (const k of targets.keys) unionKeys.add(k);
         }
       }
@@ -2907,14 +2968,16 @@ async download(key, isMetadata = false) {
 
       return {
         cutoffYear,
-        candidateChatCount: candidates.length,
-        archivableChatCount: chatCount,
+        totalChatCount,
+        undatedChatCount,
+        candidateChatCount,
+        archivableChatCount,
         totalKeysToRemove: unionKeys.size,
         blobCount,
         cacheCount,
         localBlobKeyCount: Array.from(allLocalKeys).filter((k) => String(k).startsWith("BLOB_")).length,
         localClientCacheKeyCount: Array.from(allLocalKeys).filter((k) => String(k).startsWith("CLIENT_CACHE_attachment-")).length,
-        sampleChats: candidates.slice(0, 20),
+        sampleChats,
       };
     }
     async previewArchiveAllChats() {
@@ -2946,7 +3009,7 @@ async download(key, isMetadata = false) {
             sampleChats.push({
               chatId: item.id,
               title: this._getChatTitle(item.data),
-              updatedAt: this._getChatUpdatedAtRaw(item.data),
+              updatedAt: this._getChatTimestampRaw(item.data),
             });
           }
         }
@@ -7919,6 +7982,9 @@ async download(key, isMetadata = false) {
                 `Local keys to remove: ${result.totalKeysToRemove}\n` +
                 `- Blobs: ${result.blobCount}\n` +
                 `- Client cache: ${result.cacheCount}\n` +
+                (scope === "all"
+                  ? ""
+                  : `\nDate coverage:\n- Total chats seen: ${result.totalChatCount}\n- Chats with unknown date: ${result.undatedChatCount}\n`) +
                 `\nLocal totals (all data, for sanity):\n` +
                 `- Total BLOB_* keys: ${result.localBlobKeyCount}\n` +
                 `- Total CLIENT_CACHE_attachment-* keys: ${result.localClientCacheKeyCount}\n`;
