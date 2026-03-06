@@ -2790,7 +2790,11 @@ async download(key, isMetadata = false) {
         if (Array.isArray(current)) {
           for (const v of current) stack.push(v);
         } else {
-          for (const v of Object.values(current)) stack.push(v);
+          // Some TypingMind structures use attachment IDs as object keys.
+          for (const [k, v] of Object.entries(current)) {
+            if (typeof k === "string" && k) stack.push(k);
+            stack.push(v);
+          }
         }
       }
 
@@ -2908,7 +2912,61 @@ async download(key, isMetadata = false) {
         totalKeysToRemove: unionKeys.size,
         blobCount,
         cacheCount,
+        localBlobKeyCount: Array.from(allLocalKeys).filter((k) => String(k).startsWith("BLOB_")).length,
+        localClientCacheKeyCount: Array.from(allLocalKeys).filter((k) => String(k).startsWith("CLIENT_CACHE_attachment-")).length,
         sampleChats: candidates.slice(0, 20),
+      };
+    }
+    async previewArchiveAllChats() {
+      const allLocalKeys = await this.dataService.getAllItemKeys();
+      const manifest = this.loadLocalArchiveManifest();
+      const alreadyArchived = new Set(Object.keys(manifest.chats || {}));
+
+      const unionKeys = new Set();
+      let blobCount = 0;
+      let cacheCount = 0;
+      let chatCount = 0;
+      let candidateChatCount = 0;
+      const sampleChats = [];
+
+      for await (const batch of this.dataService.streamAllItemsInternal()) {
+        for (const item of batch) {
+          if (!item?.id || item.type !== "idb") continue;
+          if (!String(item.id).startsWith("CHAT_")) continue;
+          candidateChatCount++;
+          if (alreadyArchived.has(item.id)) continue;
+          const targets = this.collectArchiveTargetsForChatPayload(
+            item.id,
+            item.data,
+            allLocalKeys
+          );
+          chatCount++;
+          for (const k of targets.keys) unionKeys.add(k);
+          if (sampleChats.length < 20) {
+            sampleChats.push({
+              chatId: item.id,
+              title: this._getChatTitle(item.data),
+              updatedAt: this._getChatUpdatedAtRaw(item.data),
+            });
+          }
+        }
+      }
+
+      for (const k of unionKeys) {
+        if (String(k).startsWith("BLOB_")) blobCount++;
+        else if (String(k).startsWith("CLIENT_CACHE_attachment-")) cacheCount++;
+      }
+
+      return {
+        scope: "all",
+        candidateChatCount,
+        archivableChatCount: chatCount,
+        totalKeysToRemove: unionKeys.size,
+        blobCount,
+        cacheCount,
+        localBlobKeyCount: Array.from(allLocalKeys).filter((k) => String(k).startsWith("BLOB_")).length,
+        localClientCacheKeyCount: Array.from(allLocalKeys).filter((k) => String(k).startsWith("CLIENT_CACHE_attachment-")).length,
+        sampleChats,
       };
     }
     async archiveChatsBeforeYear(cutoffYear, { requireCloneVerified = true } = {}) {
@@ -7002,6 +7060,14 @@ async download(key, isMetadata = false) {
                 <div class="text-xs text-zinc-400" id="local-archive-current-count">Archived: 0</div>
               </div>
 
+              <div class="flex items-center justify-between gap-2">
+                <label class="text-xs text-zinc-400">Preview scope</label>
+                <select id="archive-preview-scope" class="px-2 py-1 border border-zinc-600 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 text-xs dark:bg-zinc-700 text-white">
+                  <option value="before-2024" selected>Before 2024</option>
+                  <option value="all">All chats (any year)</option>
+                </select>
+              </div>
+
               <div class="flex gap-2">
                 <button id="preview-archive-pre2024-btn" class="px-2 py-1.5 text-sm text-white bg-blue-600 rounded-md hover:bg-blue-700 disabled:bg-gray-500 disabled:cursor-not-allowed">Preview</button>
                 <button id="archive-pre2024-btn" class="px-2 py-1.5 text-sm text-white bg-orange-600 rounded-md hover:bg-orange-700 disabled:bg-gray-500 disabled:cursor-not-allowed">Archive Locally</button>
@@ -7807,6 +7873,7 @@ async download(key, isMetadata = false) {
       const previewBtn = modal.querySelector("#preview-archive-pre2024-btn");
       const archiveBtn = modal.querySelector("#archive-pre2024-btn");
       const previewOut = modal.querySelector("#local-archive-preview");
+      const previewScope = modal.querySelector("#archive-preview-scope");
       const select = modal.querySelector("#archived-chats-select");
       const restoreSelectedBtn = modal.querySelector("#restore-archived-selected-btn");
       const restoreAllBtn = modal.querySelector("#restore-archived-all-btn");
@@ -7838,14 +7905,23 @@ async download(key, isMetadata = false) {
           previewBtn.textContent = "Working...";
           if (previewOut) previewOut.textContent = "Calculating…";
           try {
-            const result = await this.syncOrchestrator.previewArchiveBeforeYear(2024);
+            const scope = previewScope?.value || "before-2024";
+            const result =
+              scope === "all"
+                ? await this.syncOrchestrator.previewArchiveAllChats()
+                : await this.syncOrchestrator.previewArchiveBeforeYear(2024);
             if (previewOut) {
+              const scopeLabel = scope === "all" ? "ALL chats" : "before 2024";
               previewOut.textContent =
-                `Chats before 2024 (candidates): ${result.candidateChatCount}\n` +
+                `Scope: ${scopeLabel}\n` +
+                `Chats (candidates): ${result.candidateChatCount}\n` +
                 `Chats archivable now: ${result.archivableChatCount}\n` +
                 `Local keys to remove: ${result.totalKeysToRemove}\n` +
                 `- Blobs: ${result.blobCount}\n` +
-                `- Client cache: ${result.cacheCount}\n`;
+                `- Client cache: ${result.cacheCount}\n` +
+                `\nLocal totals (all data, for sanity):\n` +
+                `- Total BLOB_* keys: ${result.localBlobKeyCount}\n` +
+                `- Total CLIENT_CACHE_attachment-* keys: ${result.localClientCacheKeyCount}\n`;
             }
           } catch (error) {
             if (previewOut) previewOut.textContent = `Preview failed: ${error?.message || error}`;
