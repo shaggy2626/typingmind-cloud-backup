@@ -2762,13 +2762,22 @@ async download(key, isMetadata = false) {
         const t = typeof current;
         if (t === "string") {
           const s = current;
-          if (s.length <= 4096) {
+          // Detect explicit TypingMind keys even in long strings.
+          if (s.includes("BLOB_")) {
             for (const match of s.match(blobKeyRegex) || []) {
               explicitBlobKeys.add(match);
             }
+          }
+          if (s.includes("CLIENT_CACHE_attachment-")) {
             for (const match of s.match(cacheKeyRegex) || []) {
               explicitCacheKeys.add(match);
             }
+          }
+
+          // UUID extraction is useful when chats store only the raw UUID.
+          // To avoid spending lots of time scanning giant text fields (chat messages),
+          // cap UUID scanning to reasonably-sized strings that look like IDs.
+          if (s.includes("-") && s.length <= 50_000) {
             for (const match of s.match(uuidRegex) || []) {
               uuids.add(match);
             }
