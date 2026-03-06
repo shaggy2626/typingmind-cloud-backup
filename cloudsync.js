@@ -2654,11 +2654,16 @@ async download(key, isMetadata = false) {
       return result;
     }
     saveMetadata() {
+      const archiveManifest = this.loadLocalArchiveManifest();
+      const archivedKeySet = this.getArchivedKeySet(archiveManifest);
       const compacted = {
         ...this.metadata,
         items: {},
       };
       for (const [key, item] of Object.entries(this.metadata.items || {})) {
+        if (archivedKeySet.has(key)) {
+          continue;
+        }
         if (!item.deleted) {
           compacted.items[key] = item;
         }
@@ -2709,51 +2714,331 @@ async download(key, isMetadata = false) {
     isLocallyArchived(itemId, manifest = null) {
       return this.getArchivedKeySet(manifest).has(itemId);
     }
-    async collectArchiveTargetsForChat(chatId) {
-      const chat = await this.dataService.getItem(chatId, "idb");
+    _parseTimestampToMs(value) {
+      if (typeof value === "number") {
+        // Heuristic: treat small values as seconds (rare), larger as ms.
+        return value < 10_000_000_000 ? value * 1000 : value;
+      }
+      if (!value) return 0;
+      const ts = new Date(value).getTime();
+      return Number.isFinite(ts) ? ts : 0;
+    }
+    _getChatTitle(chat) {
+      return (
+        chat?.title ||
+        chat?.name ||
+        chat?.chatTitle ||
+        chat?.chat?.title ||
+        chat?.conversation?.title ||
+        ""
+      );
+    }
+    _getChatUpdatedAtRaw(chat) {
+      return (
+        chat?.updatedAt ||
+        chat?.updated_at ||
+        chat?.lastUpdated ||
+        chat?.modifiedAt ||
+        null
+      );
+    }
+    collectArchiveTargetsForChatPayload(chatId, chat, allLocalKeys) {
+      const uuidRegex =
+        /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
+      const blobKeyRegex =
+        /\bBLOB_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
+      const cacheKeyRegex =
+        /\bCLIENT_CACHE_attachment-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
+
+      const seenObjects = new Set();
+      const stack = [chat];
+      const uuids = new Set();
+      const explicitBlobKeys = new Set();
+      const explicitCacheKeys = new Set();
+
+      while (stack.length > 0) {
+        const current = stack.pop();
+        if (!current) continue;
+        const t = typeof current;
+        if (t === "string") {
+          const s = current;
+          if (s.length <= 4096) {
+            for (const match of s.match(blobKeyRegex) || []) {
+              explicitBlobKeys.add(match);
+            }
+            for (const match of s.match(cacheKeyRegex) || []) {
+              explicitCacheKeys.add(match);
+            }
+            for (const match of s.match(uuidRegex) || []) {
+              uuids.add(match);
+            }
+          }
+          continue;
+        }
+        if (t !== "object") continue;
+        if (seenObjects.has(current)) continue;
+        seenObjects.add(current);
+        if (Array.isArray(current)) {
+          for (const v of current) stack.push(v);
+        } else {
+          for (const v of Object.values(current)) stack.push(v);
+        }
+      }
+
+      const relatedKeysSet = new Set();
+      relatedKeysSet.add(chatId);
+
+      for (const key of explicitBlobKeys) {
+        if (allLocalKeys.has(key)) relatedKeysSet.add(key);
+      }
+      for (const key of explicitCacheKeys) {
+        if (allLocalKeys.has(key)) relatedKeysSet.add(key);
+      }
+      for (const uuid of uuids) {
+        const blobKey = `BLOB_${uuid}`;
+        const cacheKey = `CLIENT_CACHE_attachment-${uuid}`;
+        if (allLocalKeys.has(blobKey)) relatedKeysSet.add(blobKey);
+        if (allLocalKeys.has(cacheKey)) relatedKeysSet.add(cacheKey);
+      }
+
+      const keys = Array.from(relatedKeysSet);
+      const blobCount = keys.filter((k) => k.startsWith("BLOB_")).length;
+      const cacheCount = keys.filter((k) =>
+        k.startsWith("CLIENT_CACHE_attachment-")
+      ).length;
+
+      return {
+        chatId,
+        title: this._getChatTitle(chat),
+        updatedAt: this._getChatUpdatedAtRaw(chat),
+        updatedAtMs: this._parseTimestampToMs(this._getChatUpdatedAtRaw(chat)),
+        uuids: Array.from(uuids),
+        keys,
+        keySummary: {
+          chats: 1,
+          blobs: blobCount,
+          caches: cacheCount,
+          totalKeys: keys.length,
+        },
+      };
+    }
+    async collectArchiveTargetsForChat(chatId, allLocalKeysOverride = null, chatOverride = null) {
+      const chat = chatOverride || (await this.dataService.getItem(chatId, "idb"));
       if (!chat) {
         throw new Error(`Chat not found locally: ${chatId}`);
       }
-      let chatJson = "";
-      try {
-        chatJson = JSON.stringify(chat);
-      } catch (error) {
-        throw new Error(
-          `Could not inspect chat payload for ${chatId}: ${error.message}`
-        );
+      const allLocalKeys =
+        allLocalKeysOverride || (await this.dataService.getAllItemKeys());
+      return this.collectArchiveTargetsForChatPayload(chatId, chat, allLocalKeys);
+    }
+    async listLocalChatsBeforeYear(cutoffYear) {
+      const chats = [];
+      for await (const batch of this.dataService.streamAllItemsInternal()) {
+        for (const item of batch) {
+          if (!item?.id || item.type !== "idb") continue;
+          if (!String(item.id).startsWith("CHAT_")) continue;
+          const updatedAtRaw = this._getChatUpdatedAtRaw(item.data);
+          const updatedAtMs = this._parseTimestampToMs(updatedAtRaw);
+          if (!updatedAtMs) continue;
+          const year = new Date(updatedAtMs).getFullYear();
+          if (year < cutoffYear) {
+            chats.push({
+              chatId: item.id,
+              title: this._getChatTitle(item.data),
+              updatedAt: updatedAtRaw,
+              updatedAtMs,
+            });
+          }
+        }
       }
-      const uuidRegex =
-        /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
-      const uuids = Array.from(new Set(chatJson.match(uuidRegex) || []));
+      chats.sort((a, b) => (a.updatedAtMs || 0) - (b.updatedAtMs || 0));
+      return chats;
+    }
+    async previewArchiveBeforeYear(cutoffYear) {
       const allLocalKeys = await this.dataService.getAllItemKeys();
-      const relatedKeys = [];
-      for (const key of allLocalKeys) {
-        if (key === chatId) {
-          relatedKeys.push(key);
+      const candidates = await this.listLocalChatsBeforeYear(cutoffYear);
+      const manifest = this.loadLocalArchiveManifest();
+      const alreadyArchived = new Set(Object.keys(manifest.chats || {}));
+
+      const unionKeys = new Set();
+      let blobCount = 0;
+      let cacheCount = 0;
+      let chatCount = 0;
+
+      // We need payloads to find attachments/caches; re-stream chats only.
+      for await (const batch of this.dataService.streamAllItemsInternal()) {
+        for (const item of batch) {
+          if (!item?.id || item.type !== "idb") continue;
+          if (!String(item.id).startsWith("CHAT_")) continue;
+          if (alreadyArchived.has(item.id)) continue;
+          const updatedAtRaw = this._getChatUpdatedAtRaw(item.data);
+          const updatedAtMs = this._parseTimestampToMs(updatedAtRaw);
+          if (!updatedAtMs) continue;
+          const year = new Date(updatedAtMs).getFullYear();
+          if (year >= cutoffYear) continue;
+
+          const targets = this.collectArchiveTargetsForChatPayload(
+            item.id,
+            item.data,
+            allLocalKeys
+          );
+          chatCount++;
+          for (const k of targets.keys) unionKeys.add(k);
+        }
+      }
+
+      for (const k of unionKeys) {
+        if (k.startsWith("BLOB_")) blobCount++;
+        else if (k.startsWith("CLIENT_CACHE_attachment-")) cacheCount++;
+      }
+
+      return {
+        cutoffYear,
+        candidateChatCount: candidates.length,
+        archivableChatCount: chatCount,
+        totalKeysToRemove: unionKeys.size,
+        blobCount,
+        cacheCount,
+        sampleChats: candidates.slice(0, 20),
+      };
+    }
+    async archiveChatsBeforeYear(cutoffYear, { requireCloneVerified = true } = {}) {
+      if (!this.storageService || !this.storageService.isConfigured()) {
+        throw new Error("Cloud storage must be configured before archiving.");
+      }
+      if (this.syncInProgress) {
+        throw new Error("Sync already in progress. Try again in a moment.");
+      }
+      if (requireCloneVerified) {
+        const cloneVerified = localStorage.getItem("tcs_clone_verified") === "true";
+        if (!cloneVerified) {
+          throw new Error(
+            "Bulk archive is locked until you confirm the clone bucket is complete (toggle in UI)."
+          );
+        }
+      }
+
+      this.logger.log(
+        "start",
+        `📦 Starting local-only archive for chats before ${cutoffYear}`
+      );
+
+      // Safety: ensure cloud has the latest before pruning local.
+      await this.performFullSync();
+
+      const cloudMetadata = await this.getCloudMetadata();
+      const allLocalKeys = await this.dataService.getAllItemKeys();
+      const manifest = this.loadLocalArchiveManifest();
+      const alreadyArchived = new Set(Object.keys(manifest.chats || {}));
+
+      const archivedChats = [];
+      const skippedChats = [];
+      const missingFromCloudByChat = [];
+      const deletedKeys = new Set();
+
+      const candidates = await this.listLocalChatsBeforeYear(cutoffYear);
+      for (const candidate of candidates) {
+        const chatId = candidate.chatId;
+        if (alreadyArchived.has(chatId)) continue;
+
+        const chat = await this.dataService.getItem(chatId, "idb");
+        if (!chat) {
+          skippedChats.push({ chatId, reason: "chat_missing_locally" });
           continue;
         }
-        if (uuids.some((uuid) => key.includes(uuid))) {
-          relatedKeys.push(key);
+
+        const targets = await this.collectArchiveTargetsForChat(chatId, allLocalKeys, chat);
+        if (!targets.keys.includes(chatId)) {
+          skippedChats.push({ chatId, reason: "target_missing_chat_id" });
+          continue;
+        }
+
+        const missingFromCloud = targets.keys.filter(
+          (key) => !cloudMetadata.items?.[key]
+        );
+        if (missingFromCloud.length > 0) {
+          missingFromCloudByChat.push({
+            chatId,
+            missingCount: missingFromCloud.length,
+          });
+          skippedChats.push({ chatId, reason: "missing_in_cloud_metadata" });
+          continue;
+        }
+
+        manifest.chats[chatId] = {
+          archivedAt: Date.now(),
+          title: targets.title,
+          updatedAt: targets.updatedAt,
+          keys: targets.keys,
+          keySummary: targets.keySummary,
+          cutoffYear,
+        };
+
+        for (const key of targets.keys) {
+          if (deletedKeys.has(key)) continue;
+          const metadataItem = this.metadata.items[key];
+          const deleteType = metadataItem?.type === "ls" ? "ls" : "idb";
+          await this.dataService.performDelete(key, deleteType);
+          delete this.metadata.items[key];
+          deletedKeys.add(key);
+        }
+
+        archivedChats.push({
+          chatId,
+          title: targets.title,
+          updatedAt: targets.updatedAt,
+          keySummary: targets.keySummary,
+        });
+      }
+
+      this.saveLocalArchiveManifest(manifest);
+      this.saveMetadata();
+      await this.updateSyncDiagnosticsCache({ force: true });
+
+      this.logger.log("success", "✅ Local-only archive completed", {
+        archivedChats: archivedChats.length,
+        skippedChats: skippedChats.length,
+        missingFromCloudChats: missingFromCloudByChat.length,
+      });
+
+      return {
+        cutoffYear,
+        archivedChats,
+        skippedChats,
+        missingFromCloudByChat,
+      };
+    }
+    getArchivedChatsList() {
+      const manifest = this.loadLocalArchiveManifest();
+      const entries = Object.entries(manifest.chats || {}).map(([chatId, v]) => ({
+        chatId,
+        archivedAt: v?.archivedAt || 0,
+        title: v?.title || "",
+        updatedAt: v?.updatedAt || null,
+        keyCount: Array.isArray(v?.keys) ? v.keys.length : 0,
+        keySummary: v?.keySummary || null,
+      }));
+      entries.sort((a, b) => (b.archivedAt || 0) - (a.archivedAt || 0));
+      return entries;
+    }
+    async restoreAllArchivedChats() {
+      const manifest = this.loadLocalArchiveManifest();
+      const chatIds = Object.keys(manifest.chats || {});
+      const results = [];
+      for (const chatId of chatIds) {
+        try {
+          const res = await this.restoreArchivedChat(chatId);
+          results.push({ chatId, ...res });
+        } catch (error) {
+          results.push({
+            chatId,
+            fullSuccess: false,
+            restoredCount: 0,
+            error: error?.message || String(error),
+          });
         }
       }
-      return {
-        chatId,
-        title:
-          chat?.title ||
-          chat?.name ||
-          chat?.chatTitle ||
-          chat?.chat?.title ||
-          chat?.conversation?.title ||
-          "",
-        updatedAt:
-          chat?.updatedAt ||
-          chat?.updated_at ||
-          chat?.lastUpdated ||
-          chat?.modifiedAt ||
-          null,
-        uuids,
-        keys: Array.from(new Set(relatedKeys)),
-      };
+      return results;
     }
     async archiveChatLocalOnly(chatId) {
       if (!this.storageService || !this.storageService.isConfigured()) {
@@ -2792,8 +3077,10 @@ async download(key, isMetadata = false) {
         const metadataItem = this.metadata.items[key];
         const deleteType = metadataItem?.type === "ls" ? "ls" : "idb";
         await this.dataService.performDelete(key, deleteType);
+        delete this.metadata.items[key];
       }
-      await this.updateSyncDiagnosticsCache();
+      this.saveMetadata();
+      await this.updateSyncDiagnosticsCache({ force: true });
       this.logger.log(
         "success",
         `✅ Archived chat locally without tombstoning cloud: ${chatId}`,
@@ -2813,40 +3100,98 @@ async download(key, isMetadata = false) {
       if (!this.storageService || !this.storageService.isConfigured()) {
         throw new Error("Cloud storage must be configured before restoring.");
       }
-      const cloudMetadata = await this.getCloudMetadata();
-      let restoredCount = 0;
-      for (const key of archivedChat.keys || []) {
-        const cloudItem = cloudMetadata.items?.[key];
-        if (!cloudItem || cloudItem.deleted) {
-          continue;
-        }
-        const path =
-          cloudItem.type === "blob"
-            ? `attachments/${key}.bin`
-            : `items/${key}.json`;
-        const data = await this.storageService.download(path);
-        if (!data) {
-          continue;
-        }
-        if (cloudItem.type === "blob") {
-          data.blobType = cloudItem.blobType || "";
-          await this.dataService.saveItem(data, "blob", key);
-        } else {
-          await this.dataService.saveItem(data, cloudItem.type, key);
-        }
-        restoredCount++;
+      if (this.syncInProgress) {
+        throw new Error("Sync already in progress. Try again in a moment.");
       }
-      delete manifest.chats[chatId];
-      this.saveLocalArchiveManifest(manifest);
-      await this.updateSyncDiagnosticsCache();
+      const cloudMetadata = await this.getCloudMetadata();
+      const desiredKeys = Array.isArray(archivedChat.keys)
+        ? archivedChat.keys
+        : [];
+      if (!desiredKeys.includes(chatId)) {
+        desiredKeys.unshift(chatId);
+      }
+      const missingInCloud = [];
+      const deletedInCloud = [];
+      const failed = [];
+      const restored = [];
+
+      const chatCloudItem = cloudMetadata.items?.[chatId];
+      if (!chatCloudItem || chatCloudItem.deleted) {
+        throw new Error(
+          `Cannot restore: chat is missing or deleted in cloud metadata: ${chatId}`
+        );
+      }
+
+      for (const key of desiredKeys) {
+        const cloudItem = cloudMetadata.items?.[key];
+        if (!cloudItem) {
+          missingInCloud.push(key);
+          continue;
+        }
+        if (cloudItem.deleted) {
+          deletedInCloud.push(key);
+          continue;
+        }
+        try {
+          const path =
+            cloudItem.type === "blob"
+              ? `attachments/${key}.bin`
+              : `items/${key}.json`;
+          const data = await this.storageService.download(path);
+          if (!data) {
+            throw new Error("download returned empty result");
+          }
+          if (cloudItem.type === "blob") {
+            data.blobType = cloudItem.blobType || "";
+            const ok = await this.dataService.saveItem(data, "blob", key);
+            if (!ok) throw new Error("failed to save blob to IndexedDB");
+          } else {
+            const ok = await this.dataService.saveItem(data, cloudItem.type, key);
+            if (!ok) throw new Error("failed to save item to storage");
+          }
+
+          const syncTime = Date.now();
+          this.metadata.items[key] = {
+            ...cloudItem,
+            synced: syncTime,
+            lastModified: cloudItem.lastModified || syncTime,
+          };
+          restored.push(key);
+        } catch (error) {
+          failed.push({ key, error: error?.message || String(error) });
+        }
+      }
+
+      const fullSuccess = missingInCloud.length === 0 && failed.length === 0;
+      if (fullSuccess) {
+        delete manifest.chats[chatId];
+        this.saveLocalArchiveManifest(manifest);
+      }
+
+      this.saveMetadata();
+      await this.updateSyncDiagnosticsCache({ force: true });
+
       this.logger.log(
-        "success",
-        `✅ Restored archived chat locally from cloud: ${chatId}`,
+        fullSuccess ? "success" : "warning",
+        fullSuccess
+          ? `✅ Restored archived chat locally from cloud: ${chatId}`
+          : `⚠️ Partially restored archived chat (manifest retained): ${chatId}`,
         {
-          restoredCount,
+          restoredCount: restored.length,
+          missingInCloudCount: missingInCloud.length,
+          deletedInCloudCount: deletedInCloud.length,
+          failedCount: failed.length,
         }
       );
-      return { chatId, restoredCount };
+
+      return {
+        chatId,
+        fullSuccess,
+        restoredCount: restored.length,
+        missingInCloud,
+        deletedInCloud,
+        failed,
+      };
     }
     getItemSize(data) {
       return JSON.stringify(data).length;
@@ -3735,12 +4080,18 @@ async download(key, isMetadata = false) {
             "info",
             "🔍 Checking cloud for missing items to restore"
           );
+          const archiveManifest = this.loadLocalArchiveManifest();
+          const archivedKeySet = this.getArchivedKeySet(archiveManifest);
           const cloudMetadata = await this.getCloudMetadata();
           let restoredCount = 0;
           for (const [cloudItemId, cloudItem] of Object.entries(
             cloudMetadata.items || {}
           )) {
-            if (!cloudItem.deleted && !this.metadata.items[cloudItemId]) {
+            if (
+              !cloudItem.deleted &&
+              !this.metadata.items[cloudItemId] &&
+              !archivedKeySet.has(cloudItemId)
+            ) {
               try {
                 const downloadPath = cloudItem.type === "blob"
                   ? `attachments/${cloudItemId}.bin`
@@ -3973,10 +4324,32 @@ async download(key, isMetadata = false) {
           (id) => id.startsWith("CHAT_") && !cloudMetadata.items[id].deleted
         ).length;
 
+        const archiveManifest = this.loadLocalArchiveManifest();
+        const archivedKeySet = this.getArchivedKeySet(archiveManifest);
+        const archivedChatIds = Object.keys(archiveManifest.chats || {});
+        let archivedKeysActiveInCloud = 0;
+        let archivedChatsActiveInCloud = 0;
+        for (const key of archivedKeySet) {
+          const cloudItem = cloudMetadata.items?.[key];
+          if (cloudItem && !cloudItem.deleted) archivedKeysActiveInCloud++;
+        }
+        for (const chatId of archivedChatIds) {
+          const cloudItem = cloudMetadata.items?.[chatId];
+          if (cloudItem && !cloudItem.deleted) archivedChatsActiveInCloud++;
+        }
+        const cloudActiveNonArchived = Math.max(
+          0,
+          cloudActive - archivedKeysActiveInCloud
+        );
+        const cloudChatItemsNonArchived = Math.max(
+          0,
+          cloudChatItems - archivedChatsActiveInCloud
+        );
+
         const hasIssues =
           localCount !== metadataActive ||
-          metadataActive !== cloudActive ||
-          chatItems !== cloudChatItems;
+          metadataActive !== cloudActiveNonArchived ||
+          chatItems !== cloudChatItemsNonArchived;
 
         const overallStatus = hasIssues ? "⚠️" : "✅";
         const lastUpdated = new Date().toLocaleTimeString();
@@ -3985,8 +4358,10 @@ async download(key, isMetadata = false) {
         const details = [
           { type: "📱 Local Items", count: localCount },
           { type: "📋 Local Metadata", count: metadataActive },
-          { type: "☁️ Cloud Metadata", count: cloudActive },
-          { type: "💬 Chat Sync", count: `${chatItems} ⟷ ${cloudChatItems}` },
+          { type: "☁️ Cloud Metadata (non-archived)", count: cloudActiveNonArchived },
+          { type: "🗄️ Archived Chats", count: archivedChatIds.length },
+          { type: "🗄️ Archived Local Keys", count: archivedKeySet.size },
+          { type: "💬 Chat Sync (non-archived)", count: `${chatItems} ⟷ ${cloudChatItemsNonArchived}` },
           { type: "⏭️ Skipped Items", count: excludedItemCount },
         ];
 
@@ -3995,9 +4370,15 @@ async download(key, isMetadata = false) {
           localItems: localCount,
           localMetadata: metadataActive,
           cloudMetadata: cloudActive,
+          cloudMetadataNonArchived: cloudActiveNonArchived,
           chatSyncLocal: chatItems,
           chatSyncCloud: cloudChatItems,
+          chatSyncCloudNonArchived: cloudChatItemsNonArchived,
           excludedItemCount: excludedItemCount,
+          archivedChats: archivedChatIds.length,
+          archivedLocalKeys: archivedKeySet.size,
+          archivedActiveInCloud: archivedKeysActiveInCloud,
+          archivedChatActiveInCloud: archivedChatsActiveInCloud,
         };
         localStorage.setItem(
           "tcs_sync_diagnostics",
@@ -4022,7 +4403,8 @@ async download(key, isMetadata = false) {
       const _now = Date.now();
       const _last = Number(localStorage.getItem("tcs_sync_diag_last_update") || "0");
       const _minInterval = 5 * 60 * 1000;
-      if (_last && _now - _last < _minInterval) {
+      const force = arguments?.[0]?.force === true;
+      if (!force && _last && _now - _last < _minInterval) {
         return;
       }
       localStorage.setItem("tcs_sync_diag_last_update", String(_now));
@@ -4047,14 +4429,46 @@ async download(key, isMetadata = false) {
         const cloudChatItems = Object.keys(cloudMetadata.items || {}).filter(
           (id) => id.startsWith("CHAT_") && !cloudMetadata.items[id].deleted
         ).length;
+        const archiveManifest = this.loadLocalArchiveManifest();
+        const archivedKeySet = this.getArchivedKeySet(archiveManifest);
+        const archivedChatIds = Object.keys(archiveManifest.chats || {});
+        let archivedKeysActiveInCloud = 0;
+        let archivedChatsActiveInCloud = 0;
+        for (const key of archivedKeySet) {
+          const cloudItem = cloudMetadata.items?.[key];
+          if (cloudItem && !cloudItem.deleted) {
+            archivedKeysActiveInCloud++;
+          }
+        }
+        for (const chatId of archivedChatIds) {
+          const cloudItem = cloudMetadata.items?.[chatId];
+          if (cloudItem && !cloudItem.deleted) {
+            archivedChatsActiveInCloud++;
+          }
+        }
+        const cloudActiveNonArchived = Math.max(
+          0,
+          cloudActive - archivedKeysActiveInCloud
+        );
+        const cloudChatItemsNonArchived = Math.max(
+          0,
+          cloudChatItems - archivedChatsActiveInCloud
+        );
+
         const diagnosticsData = {
           timestamp: Date.now(),
           localItems: localCount,
           localMetadata: metadataActive,
           cloudMetadata: cloudActive,
+          cloudMetadataNonArchived: cloudActiveNonArchived,
           chatSyncLocal: chatItems,
           chatSyncCloud: cloudChatItems,
+          chatSyncCloudNonArchived: cloudChatItemsNonArchived,
           excludedItemCount: 0,
+          archivedChats: archivedChatIds.length,
+          archivedLocalKeys: archivedKeySet.size,
+          archivedActiveInCloud: archivedKeysActiveInCloud,
+          archivedChatActiveInCloud: archivedChatsActiveInCloud,
         };
         localStorage.setItem(
           "tcs_sync_diagnostics",
@@ -5957,6 +6371,7 @@ async download(key, isMetadata = false) {
       const sections = [
         "sync-diagnostics",
         "available-backups",
+        "local-archive",
         "provider-settings",
         "common-settings",
         "tombstones",
@@ -6477,6 +6892,7 @@ async download(key, isMetadata = false) {
              </div>
            </div>`
         : "";
+      const cloneVerified = localStorage.getItem("tcs_clone_verified") === "true";
       return `<div class="text-white text-left text-sm">
         <!-- Modal Header (Fixed) -->
         <div class="cloud-sync-modal-header">
@@ -6544,6 +6960,56 @@ async download(key, isMetadata = false) {
               <div class="flex justify-end gap-2">
                 <button id="restore-backup-btn" class="px-2 py-1.5 text-sm text-white bg-green-600 rounded-md hover:bg-green-700 disabled:bg-gray-500 disabled:cursor-not-allowed" disabled>Restore</button>
                 <button id="delete-backup-btn" class="px-2 py-1.5 text-sm text-white bg-red-600 rounded-md hover:bg-red-700 disabled:bg-gray-500 disabled:cursor-not-allowed" disabled>Delete</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Local Archive Section -->
+          <div class="mt-4 bg-zinc-800 px-3 py-2 rounded-lg border border-zinc-700">
+            <div class="flex items-center justify-between mb-2 cursor-pointer select-none" id="local-archive-header">
+              <label class="block text-sm font-medium text-zinc-300">Local Archive</label>
+              <div class="flex items-center gap-1">
+                <svg id="local-archive-chevron" class="w-4 h-4 text-zinc-400 transform transition-transform duration-200" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+              </div>
+            </div>
+            <div id="local-archive-content" class="space-y-2 hidden">
+              <div class="text-xs text-zinc-400">
+                Archive removes chats/attachments from <strong>this browser</strong> only (cloud copies stay). You can restore later.
+              </div>
+
+              <div class="flex items-center justify-between p-2 bg-zinc-900/40 rounded border border-zinc-700">
+                <div class="text-xs text-zinc-300">
+                  <div class="font-medium">Safety gate</div>
+                  <div class="text-zinc-400">Bulk archive is disabled until you confirm your S3 clone bucket finished.</div>
+                </div>
+                <label class="flex items-center gap-2 text-xs text-zinc-300">
+                  <span>Clone verified</span>
+                  <input type="checkbox" id="clone-verified-toggle" class="h-4 w-4" ${cloneVerified ? "checked" : ""}>
+                </label>
+              </div>
+
+              <div class="flex items-center justify-between">
+                <div class="text-sm text-zinc-200 font-medium">Archive chats before 2024</div>
+                <div class="text-xs text-zinc-400" id="local-archive-current-count">Archived: 0</div>
+              </div>
+
+              <div class="flex gap-2">
+                <button id="preview-archive-pre2024-btn" class="px-2 py-1.5 text-sm text-white bg-blue-600 rounded-md hover:bg-blue-700 disabled:bg-gray-500 disabled:cursor-not-allowed">Preview</button>
+                <button id="archive-pre2024-btn" class="px-2 py-1.5 text-sm text-white bg-orange-600 rounded-md hover:bg-orange-700 disabled:bg-gray-500 disabled:cursor-not-allowed">Archive Locally</button>
+              </div>
+
+              <div id="local-archive-preview" class="text-xs text-zinc-400 whitespace-pre-wrap"></div>
+
+              <div class="pt-2 border-t border-zinc-700">
+                <div class="text-sm text-zinc-200 font-medium mb-1">Restore from local archive</div>
+                <select id="archived-chats-select" class="w-full px-2 py-1.5 border border-zinc-600 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm dark:bg-zinc-700 text-white">
+                  <option value="">No archived chats</option>
+                </select>
+                <div class="flex justify-end gap-2 mt-2">
+                  <button id="restore-archived-selected-btn" class="px-2 py-1.5 text-sm text-white bg-green-600 rounded-md hover:bg-green-700 disabled:bg-gray-500 disabled:cursor-not-allowed" disabled>Restore Selected</button>
+                  <button id="restore-archived-all-btn" class="px-2 py-1.5 text-sm text-white bg-green-600 rounded-md hover:bg-green-700 disabled:bg-gray-500 disabled:cursor-not-allowed" disabled>Restore All</button>
+                </div>
+                <div id="local-archive-restore-status" class="text-xs text-zinc-400 mt-2 whitespace-pre-wrap"></div>
               </div>
             </div>
           </div>
@@ -6748,6 +7214,7 @@ async download(key, isMetadata = false) {
         const isConfigured = this.storageService?.isConfigured();
         modal.querySelector("#force-import-btn").disabled = !isConfigured;
         modal.querySelector("#force-export-btn").disabled = !isConfigured;
+        this.updateLocalArchiveUIState(modal);
       };
 
       storageSelect.addEventListener("change", updateProviderUI);
@@ -7013,6 +7480,8 @@ async download(key, isMetadata = false) {
         this.logger.enabled;
 
       this.populateFormFromUrlParams(modal);
+      this.loadLocalArchiveSection(modal);
+      this.setupLocalArchiveHandlers(modal);
       if (this.isSnapshotAvailable()) {
         this.loadBackupList(modal);
         this.setupBackupListHandlers(modal);
@@ -7258,6 +7727,265 @@ async download(key, isMetadata = false) {
       }
     }
 
+    getCloneVerified() {
+      return localStorage.getItem("tcs_clone_verified") === "true";
+    }
+    setCloneVerified(enabled) {
+      localStorage.setItem("tcs_clone_verified", enabled ? "true" : "false");
+    }
+    updateLocalArchiveUIState(modal) {
+      const previewBtn = modal.querySelector("#preview-archive-pre2024-btn");
+      const archiveBtn = modal.querySelector("#archive-pre2024-btn");
+      const restoreSelectedBtn = modal.querySelector("#restore-archived-selected-btn");
+      const restoreAllBtn = modal.querySelector("#restore-archived-all-btn");
+      const cloneToggle = modal.querySelector("#clone-verified-toggle");
+      const isConfigured = !!this.storageService?.isConfigured();
+      const cloneVerified = cloneToggle ? !!cloneToggle.checked : this.getCloneVerified();
+      if (previewBtn) {
+        previewBtn.disabled = false;
+      }
+      if (archiveBtn) {
+        archiveBtn.disabled = this.noSyncMode || !isConfigured || !cloneVerified;
+      }
+      if (restoreSelectedBtn) {
+        const select = modal.querySelector("#archived-chats-select");
+        restoreSelectedBtn.disabled =
+          this.noSyncMode || !isConfigured || !select?.value;
+      }
+      if (restoreAllBtn) {
+        const list = this.syncOrchestrator?.getArchivedChatsList?.() || [];
+        restoreAllBtn.disabled = this.noSyncMode || !isConfigured || list.length === 0;
+      }
+    }
+    loadLocalArchiveSection(modal) {
+      const countEl = modal.querySelector("#local-archive-current-count");
+      const select = modal.querySelector("#archived-chats-select");
+      const restoreSelectedBtn = modal.querySelector("#restore-archived-selected-btn");
+      const restoreAllBtn = modal.querySelector("#restore-archived-all-btn");
+      const cloneToggle = modal.querySelector("#clone-verified-toggle");
+      if (cloneToggle) {
+        cloneToggle.checked = this.getCloneVerified();
+      }
+
+      const list = this.syncOrchestrator?.getArchivedChatsList?.() || [];
+      if (countEl) {
+        countEl.textContent = `Archived: ${list.length}`;
+      }
+      if (select) {
+        if (list.length === 0) {
+          select.innerHTML = `<option value="">No archived chats</option>`;
+        } else {
+          select.innerHTML =
+            `<option value="">Select a chat…</option>` +
+            list
+              .map((c) => {
+                const title = (c.title || c.chatId).replace(/</g, "&lt;").replace(/>/g, "&gt;");
+                const archivedAt = c.archivedAt
+                  ? new Date(c.archivedAt).toLocaleDateString()
+                  : "";
+                const suffix = c.keyCount ? ` (${c.keyCount} keys)` : "";
+                return `<option value="${c.chatId}">${archivedAt} — ${title}${suffix}</option>`;
+              })
+              .join("");
+        }
+      }
+      if (restoreSelectedBtn) restoreSelectedBtn.disabled = true;
+      if (restoreAllBtn) restoreAllBtn.disabled = list.length === 0;
+      this.updateLocalArchiveUIState(modal);
+    }
+    setupLocalArchiveHandlers(modal) {
+      const cloneToggle = modal.querySelector("#clone-verified-toggle");
+      const previewBtn = modal.querySelector("#preview-archive-pre2024-btn");
+      const archiveBtn = modal.querySelector("#archive-pre2024-btn");
+      const previewOut = modal.querySelector("#local-archive-preview");
+      const select = modal.querySelector("#archived-chats-select");
+      const restoreSelectedBtn = modal.querySelector("#restore-archived-selected-btn");
+      const restoreAllBtn = modal.querySelector("#restore-archived-all-btn");
+      const restoreStatus = modal.querySelector("#local-archive-restore-status");
+
+      if (cloneToggle) {
+        const handler = (e) => {
+          this.setCloneVerified(!!e.target.checked);
+          this.updateLocalArchiveUIState(modal);
+        };
+        cloneToggle.addEventListener("change", handler);
+        this.modalCleanupCallbacks.push(() =>
+          cloneToggle.removeEventListener("change", handler)
+        );
+      }
+
+      if (select) {
+        const handler = () => this.updateLocalArchiveUIState(modal);
+        select.addEventListener("change", handler);
+        this.modalCleanupCallbacks.push(() => select.removeEventListener("change", handler));
+      }
+
+      if (previewBtn) {
+        const handler = async (e) => {
+          e.stopPropagation();
+          if (previewBtn.disabled) return;
+          const originalText = previewBtn.textContent;
+          previewBtn.disabled = true;
+          previewBtn.textContent = "Working...";
+          if (previewOut) previewOut.textContent = "Calculating…";
+          try {
+            const result = await this.syncOrchestrator.previewArchiveBeforeYear(2024);
+            if (previewOut) {
+              previewOut.textContent =
+                `Chats before 2024 (candidates): ${result.candidateChatCount}\n` +
+                `Chats archivable now: ${result.archivableChatCount}\n` +
+                `Local keys to remove: ${result.totalKeysToRemove}\n` +
+                `- Blobs: ${result.blobCount}\n` +
+                `- Client cache: ${result.cacheCount}\n`;
+            }
+          } catch (error) {
+            if (previewOut) previewOut.textContent = `Preview failed: ${error?.message || error}`;
+          } finally {
+            previewBtn.textContent = originalText;
+            previewBtn.disabled = false;
+          }
+        };
+        previewBtn.addEventListener("click", handler);
+        this.modalCleanupCallbacks.push(() =>
+          previewBtn.removeEventListener("click", handler)
+        );
+      }
+
+      if (archiveBtn) {
+        const handler = async (e) => {
+          e.stopPropagation();
+          if (archiveBtn.disabled) return;
+          const cloneVerified = this.getCloneVerified();
+          if (!cloneVerified) {
+            alert("Bulk archive is locked until you confirm the clone bucket is complete.");
+            return;
+          }
+          if (
+            !confirm(
+              "Archive chats before 2024 from THIS BROWSER only?\n\n- Cloud copies remain intact.\n- This deletes chats + linked BLOB_ + CLIENT_CACHE_attachment-* locally.\n- You can restore later.\n\nThis will run a full sync first.\n\nContinue?"
+            )
+          ) {
+            return;
+          }
+          const originalText = archiveBtn.textContent;
+          archiveBtn.disabled = true;
+          archiveBtn.textContent = "Archiving...";
+          if (previewOut) previewOut.textContent = "Archiving…";
+          this.updateSyncStatus("syncing");
+          try {
+            const result = await this.syncOrchestrator.archiveChatsBeforeYear(2024, {
+              requireCloneVerified: true,
+            });
+            if (previewOut) {
+              previewOut.textContent =
+                `Archived chats: ${result.archivedChats.length}\n` +
+                `Skipped chats: ${result.skippedChats.length}\n`;
+            }
+            this.updateSyncStatus("success");
+          } catch (error) {
+            this.updateSyncStatus("error");
+            if (previewOut) previewOut.textContent = `Archive failed: ${error?.message || error}`;
+            alert(`Archive failed: ${error?.message || error}`);
+          } finally {
+            archiveBtn.textContent = originalText;
+            this.loadLocalArchiveSection(modal);
+            this.loadSyncDiagnostics(modal);
+            archiveBtn.disabled = false;
+            this.updateLocalArchiveUIState(modal);
+          }
+        };
+        archiveBtn.addEventListener("click", handler);
+        this.modalCleanupCallbacks.push(() =>
+          archiveBtn.removeEventListener("click", handler)
+        );
+      }
+
+      if (restoreSelectedBtn) {
+        const handler = async (e) => {
+          e.stopPropagation();
+          const chatId = select?.value;
+          if (!chatId) return;
+          if (
+            !confirm(
+              `Restore archived chat locally from cloud?\n\n${chatId}\n\nThis will download items back into this browser. Continue?`
+            )
+          ) {
+            return;
+          }
+          const originalText = restoreSelectedBtn.textContent;
+          restoreSelectedBtn.disabled = true;
+          restoreSelectedBtn.textContent = "Restoring...";
+          if (restoreStatus) restoreStatus.textContent = "Restoring…";
+          this.updateSyncStatus("syncing");
+          try {
+            const res = await this.syncOrchestrator.restoreArchivedChat(chatId);
+            if (restoreStatus) {
+              restoreStatus.textContent =
+                `Restored keys: ${res.restoredCount}\n` +
+                `Full success: ${res.fullSuccess}\n`;
+            }
+            this.updateSyncStatus("success");
+          } catch (error) {
+            this.updateSyncStatus("error");
+            if (restoreStatus) restoreStatus.textContent = `Restore failed: ${error?.message || error}`;
+            alert(`Restore failed: ${error?.message || error}`);
+          } finally {
+            restoreSelectedBtn.textContent = originalText;
+            this.loadLocalArchiveSection(modal);
+            this.loadSyncDiagnostics(modal);
+            this.updateLocalArchiveUIState(modal);
+          }
+        };
+        restoreSelectedBtn.addEventListener("click", handler);
+        this.modalCleanupCallbacks.push(() =>
+          restoreSelectedBtn.removeEventListener("click", handler)
+        );
+      }
+
+      if (restoreAllBtn) {
+        const handler = async (e) => {
+          e.stopPropagation();
+          if (
+            !confirm(
+              "Restore ALL archived chats locally from cloud?\n\nThis may take a while and will download many items back into this browser.\n\nContinue?"
+            )
+          ) {
+            return;
+          }
+          const originalText = restoreAllBtn.textContent;
+          restoreAllBtn.disabled = true;
+          restoreAllBtn.textContent = "Restoring...";
+          if (restoreStatus) restoreStatus.textContent = "Restoring all…";
+          this.updateSyncStatus("syncing");
+          try {
+            const results = await this.syncOrchestrator.restoreAllArchivedChats();
+            const ok = results.filter((r) => r.fullSuccess).length;
+            const partial = results.length - ok;
+            if (restoreStatus) {
+              restoreStatus.textContent =
+                `Restore complete.\n` +
+                `Full success: ${ok}\n` +
+                `Partial/failed: ${partial}\n`;
+            }
+            this.updateSyncStatus("success");
+          } catch (error) {
+            this.updateSyncStatus("error");
+            if (restoreStatus) restoreStatus.textContent = `Restore all failed: ${error?.message || error}`;
+            alert(`Restore all failed: ${error?.message || error}`);
+          } finally {
+            restoreAllBtn.textContent = originalText;
+            this.loadLocalArchiveSection(modal);
+            this.loadSyncDiagnostics(modal);
+            this.updateLocalArchiveUIState(modal);
+          }
+        };
+        restoreAllBtn.addEventListener("click", handler);
+        this.modalCleanupCallbacks.push(() =>
+          restoreAllBtn.removeEventListener("click", handler)
+        );
+      }
+    }
+
     async loadSyncDiagnostics(modal) {
       const diagnosticsBody = modal.querySelector("#sync-diagnostics-body");
       if (!diagnosticsBody) return;
@@ -7306,6 +8034,21 @@ async download(key, isMetadata = false) {
         }
 
         const data = JSON.parse(diagnosticsData);
+        const cloudNonArchived =
+          typeof data.cloudMetadataNonArchived === "number"
+            ? data.cloudMetadataNonArchived
+            : Math.max(
+                0,
+                (data.cloudMetadata || 0) - (data.archivedActiveInCloud || 0)
+              );
+        const chatCloudNonArchived =
+          typeof data.chatSyncCloudNonArchived === "number"
+            ? data.chatSyncCloudNonArchived
+            : Math.max(
+                0,
+                (data.chatSyncCloud || 0) -
+                  (data.archivedChatActiveInCloud || 0)
+              );
         const rows = [
           {
             type: "📱 Local Items",
@@ -7316,12 +8059,20 @@ async download(key, isMetadata = false) {
             count: data.localMetadata || 0,
           },
           {
-            type: "☁️ Cloud Metadata",
-            count: data.cloudMetadata || 0,
+            type: "☁️ Cloud Metadata (non-archived)",
+            count: cloudNonArchived,
           },
           {
-            type: "💬 Chat Sync",
-            count: `${data.chatSyncLocal || 0} ⟷ ${data.chatSyncCloud || 0}`,
+            type: "🗄️ Archived Chats",
+            count: data.archivedChats || 0,
+          },
+          {
+            type: "🗄️ Archived Local Keys",
+            count: data.archivedLocalKeys || 0,
+          },
+          {
+            type: "💬 Chat Sync (non-archived)",
+            count: `${data.chatSyncLocal || 0} ⟷ ${chatCloudNonArchived}`,
           },
           {
             type: "⏭️ Skipped Items",
@@ -7341,9 +8092,9 @@ async download(key, isMetadata = false) {
           .join("");
 
         const hasIssues =
-          data.localItems !== data.localMetadata ||
-          data.localMetadata !== data.cloudMetadata ||
-          data.chatSyncLocal !== data.chatSyncCloud;
+          (data.localItems || 0) !== (data.localMetadata || 0) ||
+          (data.localMetadata || 0) !== cloudNonArchived ||
+          (data.chatSyncLocal || 0) !== chatCloudNonArchived;
 
         const overallStatus = hasIssues ? "⚠️" : "✅";
         const lastUpdated = new Date(data.timestamp || 0).toLocaleTimeString();
