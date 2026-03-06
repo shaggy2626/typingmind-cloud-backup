@@ -2646,6 +2646,7 @@ async download(key, isMetadata = false) {
       this.metadata = this.loadMetadata();
       this.syncInProgress = false;
       this.autoSyncInterval = null;
+      this.LOCAL_ARCHIVE_MANIFEST_KEY = "tcs_local-archive-manifest";
     }
     loadMetadata() {
       const stored = localStorage.getItem("tcs_local-metadata");
@@ -2670,6 +2671,182 @@ async download(key, isMetadata = false) {
     }
     setLastCloudSync(timestamp) {
       localStorage.setItem("tcs_last-cloud-sync", timestamp.toString());
+    }
+    loadLocalArchiveManifest() {
+      try {
+        const stored = localStorage.getItem(this.LOCAL_ARCHIVE_MANIFEST_KEY);
+        if (!stored) {
+          return { version: 1, chats: {} };
+        }
+        const parsed = JSON.parse(stored);
+        if (!parsed || typeof parsed !== "object") {
+          return { version: 1, chats: {} };
+        }
+        if (!parsed.chats || typeof parsed.chats !== "object") {
+          parsed.chats = {};
+        }
+        return parsed;
+      } catch {
+        return { version: 1, chats: {} };
+      }
+    }
+    saveLocalArchiveManifest(manifest) {
+      localStorage.setItem(
+        this.LOCAL_ARCHIVE_MANIFEST_KEY,
+        JSON.stringify(manifest)
+      );
+    }
+    getArchivedKeySet(manifest = null) {
+      const sourceManifest = manifest || this.loadLocalArchiveManifest();
+      const archivedKeys = new Set();
+      for (const chatEntry of Object.values(sourceManifest.chats || {})) {
+        for (const key of chatEntry?.keys || []) {
+          archivedKeys.add(key);
+        }
+      }
+      return archivedKeys;
+    }
+    isLocallyArchived(itemId, manifest = null) {
+      return this.getArchivedKeySet(manifest).has(itemId);
+    }
+    async collectArchiveTargetsForChat(chatId) {
+      const chat = await this.dataService.getItem(chatId, "idb");
+      if (!chat) {
+        throw new Error(`Chat not found locally: ${chatId}`);
+      }
+      let chatJson = "";
+      try {
+        chatJson = JSON.stringify(chat);
+      } catch (error) {
+        throw new Error(
+          `Could not inspect chat payload for ${chatId}: ${error.message}`
+        );
+      }
+      const uuidRegex =
+        /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+      const uuids = Array.from(new Set(chatJson.match(uuidRegex) || []));
+      const allLocalKeys = await this.dataService.getAllItemKeys();
+      const relatedKeys = [];
+      for (const key of allLocalKeys) {
+        if (key === chatId) {
+          relatedKeys.push(key);
+          continue;
+        }
+        if (uuids.some((uuid) => key.includes(uuid))) {
+          relatedKeys.push(key);
+        }
+      }
+      return {
+        chatId,
+        title:
+          chat?.title ||
+          chat?.name ||
+          chat?.chatTitle ||
+          chat?.chat?.title ||
+          chat?.conversation?.title ||
+          "",
+        updatedAt:
+          chat?.updatedAt ||
+          chat?.updated_at ||
+          chat?.lastUpdated ||
+          chat?.modifiedAt ||
+          null,
+        uuids,
+        keys: Array.from(new Set(relatedKeys)),
+      };
+    }
+    async archiveChatLocalOnly(chatId) {
+      if (!this.storageService || !this.storageService.isConfigured()) {
+        throw new Error("Cloud storage must be configured before archiving.");
+      }
+      if (this.syncInProgress) {
+        throw new Error("Sync already in progress. Try again in a moment.");
+      }
+      this.logger.log(
+        "start",
+        `📦 Starting local-only archive test for chat ${chatId}`
+      );
+      await this.performFullSync();
+      const archiveTargets = await this.collectArchiveTargetsForChat(chatId);
+      if (!archiveTargets.keys.includes(chatId)) {
+        throw new Error(`Archive target chat was not included: ${chatId}`);
+      }
+      const cloudMetadata = await this.getCloudMetadata();
+      const missingFromCloud = archiveTargets.keys.filter(
+        (key) => !cloudMetadata.items?.[key]
+      );
+      if (missingFromCloud.length > 0) {
+        throw new Error(
+          `Archive aborted because ${missingFromCloud.length} linked item(s) are not in cloud yet.`
+        );
+      }
+      const manifest = this.loadLocalArchiveManifest();
+      manifest.chats[chatId] = {
+        archivedAt: Date.now(),
+        title: archiveTargets.title,
+        updatedAt: archiveTargets.updatedAt,
+        keys: archiveTargets.keys,
+      };
+      this.saveLocalArchiveManifest(manifest);
+      for (const key of archiveTargets.keys) {
+        const metadataItem = this.metadata.items[key];
+        const deleteType = metadataItem?.type === "ls" ? "ls" : "idb";
+        await this.dataService.performDelete(key, deleteType);
+      }
+      await this.updateSyncDiagnosticsCache();
+      this.logger.log(
+        "success",
+        `✅ Archived chat locally without tombstoning cloud: ${chatId}`,
+        {
+          relatedKeyCount: archiveTargets.keys.length,
+          title: archiveTargets.title,
+        }
+      );
+      return archiveTargets;
+    }
+    async restoreArchivedChat(chatId) {
+      const manifest = this.loadLocalArchiveManifest();
+      const archivedChat = manifest.chats?.[chatId];
+      if (!archivedChat) {
+        throw new Error(`No archived chat entry found for ${chatId}`);
+      }
+      if (!this.storageService || !this.storageService.isConfigured()) {
+        throw new Error("Cloud storage must be configured before restoring.");
+      }
+      const cloudMetadata = await this.getCloudMetadata();
+      let restoredCount = 0;
+      for (const key of archivedChat.keys || []) {
+        const cloudItem = cloudMetadata.items?.[key];
+        if (!cloudItem || cloudItem.deleted) {
+          continue;
+        }
+        const path =
+          cloudItem.type === "blob"
+            ? `attachments/${key}.bin`
+            : `items/${key}.json`;
+        const data = await this.storageService.download(path);
+        if (!data) {
+          continue;
+        }
+        if (cloudItem.type === "blob") {
+          data.blobType = cloudItem.blobType || "";
+          await this.dataService.saveItem(data, "blob", key);
+        } else {
+          await this.dataService.saveItem(data, cloudItem.type, key);
+        }
+        restoredCount++;
+      }
+      delete manifest.chats[chatId];
+      this.saveLocalArchiveManifest(manifest);
+      await this.updateSyncDiagnosticsCache();
+      this.logger.log(
+        "success",
+        `✅ Restored archived chat locally from cloud: ${chatId}`,
+        {
+          restoredCount,
+        }
+      );
+      return { chatId, restoredCount };
     }
     getItemSize(data) {
       return JSON.stringify(data).length;
@@ -2739,6 +2916,8 @@ async download(key, isMetadata = false) {
       const changedItems = [];
       const now = Date.now();
       const localItemKeys = await this.dataService.getAllItemKeys();
+      const archiveManifest = this.loadLocalArchiveManifest();
+      const archivedKeySet = this.getArchivedKeySet(archiveManifest);
 
       this.logger.log(
         "info",
@@ -2873,6 +3052,9 @@ async download(key, isMetadata = false) {
       let newlyDeletedCount = 0;
       for (const itemId in this.metadata.items) {
         const metadataItem = this.metadata.items[itemId];
+        if (archivedKeySet.has(itemId)) {
+          continue;
+        }
 
         if (!localItemKeys.has(itemId) && !metadataItem.deleted) {
           this.logger.log(
@@ -3086,6 +3268,8 @@ async download(key, isMetadata = false) {
       try {
         const { metadata: cloudMetadata, etag: cloudMetadataETag } =
           await this.getCloudMetadataWithETag();
+        const archiveManifest = this.loadLocalArchiveManifest();
+        const archivedKeySet = this.getArchivedKeySet(archiveManifest);
         this.logger.log("info", "Downloaded cloud metadata", {
           ETag: cloudMetadataETag,
           lastSync: cloudMetadata.lastSync
@@ -3156,6 +3340,9 @@ async download(key, isMetadata = false) {
         const itemsToDownload = Object.entries(cloudMetadata.items).filter(
           ([key, cloudItem]) => {
             if (this.config.shouldExclude(key)) {
+              return false;
+            }
+            if (archivedKeySet.has(key) && !cloudItem.deleted) {
               return false;
             }
             const localItem = this.metadata.items[key];
@@ -7639,6 +7826,30 @@ async loadTombstoneList(modal) {
       return Array.from(app.dataService.getAllTombstones().entries());
     }
     return [];
+  };
+  window.collectArchiveTargetsForChat = async (chatId) => {
+    if (app?.syncOrchestrator) {
+      return app.syncOrchestrator.collectArchiveTargetsForChat(chatId);
+    }
+    return { error: "Sync orchestrator not available" };
+  };
+  window.archiveChatLocalOnly = async (chatId) => {
+    if (app?.syncOrchestrator) {
+      return app.syncOrchestrator.archiveChatLocalOnly(chatId);
+    }
+    return { error: "Sync orchestrator not available" };
+  };
+  window.restoreArchivedChat = async (chatId) => {
+    if (app?.syncOrchestrator) {
+      return app.syncOrchestrator.restoreArchivedChat(chatId);
+    }
+    return { error: "Sync orchestrator not available" };
+  };
+  window.getLocalArchiveManifest = () => {
+    if (app?.syncOrchestrator) {
+      return app.syncOrchestrator.loadLocalArchiveManifest();
+    }
+    return { error: "Sync orchestrator not available" };
   };
   window.getMemoryStats = () => {
     if (app) {
