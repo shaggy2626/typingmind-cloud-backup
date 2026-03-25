@@ -21,7 +21,7 @@ Contributors (Docs & Fixes):
 - McQuade (Stability improvements) [2025-12-28]
 */
 
-const TCS_BUILD_VERSION = "2026-03-24.4";
+const TCS_BUILD_VERSION = "2026-03-24.5";
 
 if (window.typingMindCloudSync) {
   console.log("TypingMind Cloud Sync already loaded");
@@ -7178,7 +7178,7 @@ async download(key, isMetadata = false) {
                   <div id="archived-chats-filter-count" class="text-xs text-zinc-500"></div>
                 </div>
                 <input id="archived-chats-search" type="text" placeholder="Search by title or chat ID..." class="w-full px-2 py-1.5 mb-1 border border-zinc-600 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 text-xs dark:bg-zinc-700 text-white">
-                <div id="archived-chats-list" class="w-full max-h-52 overflow-y-auto overflow-x-hidden border border-zinc-600 rounded-md bg-zinc-700" style="min-height:36px;"></div>
+                <div id="archived-chats-list" class="w-full border border-zinc-600 rounded-md bg-zinc-700" style="max-height:200px;overflow-y:auto;overflow-x:hidden;min-height:36px;"></div>
                 <div class="flex justify-end gap-2 mt-2">
                   <button id="restore-archived-selected-btn" class="px-2 py-1.5 text-sm text-white bg-green-600 rounded-md hover:bg-green-700 disabled:bg-gray-500 disabled:cursor-not-allowed" disabled>Restore Selected</button>
                   <button id="remove-archived-entry-btn" class="px-2 py-1.5 text-sm text-white bg-red-600 rounded-md hover:bg-red-700 disabled:bg-gray-500 disabled:cursor-not-allowed" disabled>Remove Entry</button>
