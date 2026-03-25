@@ -21,7 +21,7 @@ Contributors (Docs & Fixes):
 - McQuade (Stability improvements) [2025-12-28]
 */
 
-const TCS_BUILD_VERSION = "2026-03-24.1";
+const TCS_BUILD_VERSION = "2026-03-24.2";
 
 if (window.typingMindCloudSync) {
   console.log("TypingMind Cloud Sync already loaded");
@@ -7172,10 +7172,12 @@ async download(key, isMetadata = false) {
               <div id="local-archive-preview" class="text-xs text-zinc-400 whitespace-pre-wrap"></div>
 
               <div class="pt-2 border-t border-zinc-700">
-                <div class="text-sm text-zinc-200 font-medium mb-1">Restore from local archive</div>
-                <select id="archived-chats-select" class="w-full px-2 py-1.5 border border-zinc-600 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm dark:bg-zinc-700 text-white">
-                  <option value="">No archived chats</option>
-                </select>
+                <div class="flex items-center justify-between mb-1">
+                  <div class="text-sm text-zinc-200 font-medium">Restore from local archive</div>
+                  <div id="archived-chats-filter-count" class="text-xs text-zinc-500"></div>
+                </div>
+                <input id="archived-chats-search" type="text" placeholder="Search by title or chat ID..." class="w-full px-2 py-1.5 mb-1 border border-zinc-600 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 text-xs dark:bg-zinc-700 text-white">
+                <div id="archived-chats-list" class="w-full max-h-48 overflow-y-auto border border-zinc-600 rounded-md bg-zinc-700" style="min-height:40px;"></div>
                 <div class="flex justify-end gap-2 mt-2">
                   <button id="restore-archived-selected-btn" class="px-2 py-1.5 text-sm text-white bg-green-600 rounded-md hover:bg-green-700 disabled:bg-gray-500 disabled:cursor-not-allowed" disabled>Restore Selected</button>
                   <button id="remove-archived-entry-btn" class="px-2 py-1.5 text-sm text-white bg-red-600 rounded-md hover:bg-red-700 disabled:bg-gray-500 disabled:cursor-not-allowed" disabled>Remove Entry</button>
@@ -7905,9 +7907,10 @@ async download(key, isMetadata = false) {
       const restoreSelectedBtn = modal.querySelector("#restore-archived-selected-btn");
       const removeEntryBtn = modal.querySelector("#remove-archived-entry-btn");
       const restoreAllBtn = modal.querySelector("#restore-archived-all-btn");
+      const listContainer = modal.querySelector("#archived-chats-list");
       const isConfigured = !!this.storageService?.isConfigured();
-      const select = modal.querySelector("#archived-chats-select");
-      const hasSelection = !!select?.value;
+      const selectedRow = listContainer?.querySelector(".archived-chat-row[data-selected]");
+      const hasSelection = !!selectedRow;
       if (previewBtn) {
         previewBtn.disabled = false;
       }
@@ -7922,13 +7925,15 @@ async download(key, isMetadata = false) {
         removeEntryBtn.disabled = !hasSelection;
       }
       if (restoreAllBtn) {
-        const list = this.syncOrchestrator?.getArchivedChatsList?.() || [];
+        const list = this._archivedChatsList || this.syncOrchestrator?.getArchivedChatsList?.() || [];
         restoreAllBtn.disabled = this.noSyncMode || !isConfigured || list.length === 0;
       }
     }
     loadLocalArchiveSection(modal) {
       const countEl = modal.querySelector("#local-archive-current-count");
-      const select = modal.querySelector("#archived-chats-select");
+      const listContainer = modal.querySelector("#archived-chats-list");
+      const filterCountEl = modal.querySelector("#archived-chats-filter-count");
+      const searchInput = modal.querySelector("#archived-chats-search");
       const restoreSelectedBtn = modal.querySelector("#restore-archived-selected-btn");
       const restoreAllBtn = modal.querySelector("#restore-archived-all-btn");
       const cutoffDateInput = modal.querySelector("#archive-cutoff-date");
@@ -7943,12 +7948,16 @@ async download(key, isMetadata = false) {
       }
 
       const list = this.syncOrchestrator?.getArchivedChatsList?.() || [];
+      this._archivedChatsList = list;
       if (countEl) {
         countEl.textContent = `Archived: ${list.length}`;
       }
-      if (select) {
+      if (filterCountEl) {
+        filterCountEl.textContent = list.length > 0 ? `${list.length} of ${list.length}` : "";
+      }
+      if (listContainer) {
         if (list.length === 0) {
-          select.innerHTML = `<option value="">No archived chats</option>`;
+          listContainer.innerHTML = `<div class="px-3 py-2 text-xs text-zinc-500">No archived chats</div>`;
         } else {
           const parseToMs = (value) => {
             if (typeof value === "number") {
@@ -7958,23 +7967,23 @@ async download(key, isMetadata = false) {
             const ms = new Date(value).getTime();
             return Number.isFinite(ms) ? ms : 0;
           };
-          select.innerHTML =
-            `<option value="">Select a chat…</option>` +
-            list
-              .map((c) => {
-                const title = (c.title || "").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-                const archivedAt = c.archivedAt
-                  ? new Date(c.archivedAt).toLocaleDateString()
-                  : "";
-                const updatedAtMs = parseToMs(c.updatedAt);
-                const updatedAt = updatedAtMs ? new Date(updatedAtMs).toLocaleDateString() : "";
-                const suffix = c.keyCount ? ` (${c.keyCount} keys)` : "";
-                const labelTitle = title || c.chatId;
-                const datePart = updatedAt ? `Last: ${updatedAt}` : (archivedAt ? `Archived: ${archivedAt}` : "");
-                return `<option value="${c.chatId}">${datePart} — ${labelTitle} — ${c.chatId}${suffix}</option>`;
-              })
-              .join("");
+          listContainer.innerHTML = list
+            .map((c) => {
+              const esc = (s) => (s || "").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+              const title = esc(c.title) || c.chatId;
+              const updatedAtMs = parseToMs(c.updatedAt);
+              const datePart = updatedAtMs
+                ? new Date(updatedAtMs).toLocaleDateString()
+                : (c.archivedAt ? new Date(c.archivedAt).toLocaleDateString() : "");
+              const keys = c.keyCount || 0;
+              return `<div class="archived-chat-row flex items-center gap-2 px-3 py-1.5 cursor-pointer hover:bg-zinc-600 text-xs text-zinc-300 border-b border-zinc-600/50" data-chat-id="${c.chatId}" data-title="${esc(c.title)}" data-search="${esc(c.title).toLowerCase()} ${c.chatId.toLowerCase()}"><span class="shrink-0 text-zinc-500 w-20">${datePart}</span><span class="truncate flex-1" title="${title}">${title}</span><span class="shrink-0 text-zinc-500">${keys ? keys + "k" : ""}</span></div>`;
+            })
+            .join("");
         }
+        listContainer.querySelector(".archived-chat-row[data-selected]")?.removeAttribute("data-selected");
+      }
+      if (searchInput) {
+        searchInput.value = "";
       }
       if (restoreSelectedBtn) restoreSelectedBtn.disabled = true;
       if (restoreAllBtn) restoreAllBtn.disabled = list.length === 0;
@@ -7985,11 +7994,18 @@ async download(key, isMetadata = false) {
       const archiveBtn = modal.querySelector("#archive-pre2024-btn");
       const previewOut = modal.querySelector("#local-archive-preview");
       const cutoffDateInput = modal.querySelector("#archive-cutoff-date");
-      const select = modal.querySelector("#archived-chats-select");
+      const listContainer = modal.querySelector("#archived-chats-list");
+      const searchInput = modal.querySelector("#archived-chats-search");
+      const filterCountEl = modal.querySelector("#archived-chats-filter-count");
       const restoreSelectedBtn = modal.querySelector("#restore-archived-selected-btn");
       const removeEntryBtn = modal.querySelector("#remove-archived-entry-btn");
       const restoreAllBtn = modal.querySelector("#restore-archived-all-btn");
       const restoreStatus = modal.querySelector("#local-archive-restore-status");
+
+      const getSelectedChatId = () => {
+        const sel = listContainer?.querySelector(".archived-chat-row[data-selected]");
+        return sel?.getAttribute("data-chat-id") || "";
+      };
 
       if (cutoffDateInput) {
         const handler = () => {
@@ -8003,10 +8019,39 @@ async download(key, isMetadata = false) {
         );
       }
 
-      if (select) {
-        const handler = () => this.updateLocalArchiveUIState(modal);
-        select.addEventListener("change", handler);
-        this.modalCleanupCallbacks.push(() => select.removeEventListener("change", handler));
+      if (listContainer) {
+        const clickHandler = (e) => {
+          const row = e.target.closest(".archived-chat-row");
+          if (!row) return;
+          listContainer.querySelectorAll(".archived-chat-row[data-selected]").forEach(
+            (r) => { r.removeAttribute("data-selected"); r.style.backgroundColor = ""; }
+          );
+          row.setAttribute("data-selected", "true");
+          row.style.backgroundColor = "rgba(59,130,246,0.3)";
+          this.updateLocalArchiveUIState(modal);
+        };
+        listContainer.addEventListener("click", clickHandler);
+        this.modalCleanupCallbacks.push(() => listContainer.removeEventListener("click", clickHandler));
+      }
+
+      if (searchInput && listContainer) {
+        const searchHandler = () => {
+          const q = searchInput.value.toLowerCase().trim();
+          const rows = listContainer.querySelectorAll(".archived-chat-row");
+          let visible = 0;
+          rows.forEach((row) => {
+            const haystack = row.getAttribute("data-search") || "";
+            const match = !q || haystack.includes(q);
+            row.style.display = match ? "" : "none";
+            if (match) visible++;
+          });
+          if (filterCountEl) {
+            const total = rows.length;
+            filterCountEl.textContent = total > 0 ? `${visible} of ${total}` : "";
+          }
+        };
+        searchInput.addEventListener("input", searchHandler);
+        this.modalCleanupCallbacks.push(() => searchInput.removeEventListener("input", searchHandler));
       }
 
       if (previewBtn) {
@@ -8102,7 +8147,7 @@ async download(key, isMetadata = false) {
       if (restoreSelectedBtn) {
         const handler = async (e) => {
           e.stopPropagation();
-          const chatId = select?.value;
+          const chatId = getSelectedChatId();
           if (!chatId) return;
           if (
             !confirm(
@@ -8144,7 +8189,7 @@ async download(key, isMetadata = false) {
       if (removeEntryBtn) {
         const handler = (e) => {
           e.stopPropagation();
-          const chatId = select?.value;
+          const chatId = getSelectedChatId();
           if (!chatId) return;
           if (
             !confirm(
