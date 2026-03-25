@@ -21,7 +21,7 @@ Contributors (Docs & Fixes):
 - McQuade (Stability improvements) [2025-12-28]
 */
 
-const TCS_BUILD_VERSION = "2026-03-24.2";
+const TCS_BUILD_VERSION = "2026-03-24.3";
 
 if (window.typingMindCloudSync) {
   console.log("TypingMind Cloud Sync already loaded");
@@ -2738,29 +2738,7 @@ async download(key, isMetadata = false) {
       );
     }
     _getChatTimestampRaw(chat) {
-      // Prefer explicit chat-level timestamps when available.
-      const direct =
-        chat?.updatedAt ||
-        chat?.updated_at ||
-        chat?.lastUpdated ||
-        chat?.modifiedAt ||
-        chat?.createdAt ||
-        chat?.created_at ||
-        chat?.created ||
-        chat?.timestamp ||
-        chat?.ts ||
-        chat?.chat?.updatedAt ||
-        chat?.chat?.updated_at ||
-        chat?.chat?.createdAt ||
-        chat?.chat?.created_at ||
-        chat?.conversation?.updatedAt ||
-        chat?.conversation?.updated_at ||
-        chat?.conversation?.createdAt ||
-        chat?.conversation?.created_at ||
-        null;
-      if (direct) return direct;
-
-      // Fallback: last message timestamp (many older chats only have message timestamps)
+      // Best signal: last message timestamp (immune to sync-induced updatedAt bumps).
       const messages =
         (Array.isArray(chat?.messages) && chat.messages) ||
         (Array.isArray(chat?.chat?.messages) && chat.chat.messages) ||
@@ -2770,17 +2748,40 @@ async download(key, isMetadata = false) {
       if (messages && messages.length > 0) {
         const last = messages[messages.length - 1];
         if (last && typeof last === "object") {
-          return (
-            last.updatedAt ||
-            last.updated_at ||
+          const msgTs =
             last.createdAt ||
             last.created_at ||
+            last.updatedAt ||
+            last.updated_at ||
             last.timestamp ||
             last.ts ||
-            null
-          );
+            null;
+          if (msgTs) return msgTs;
         }
       }
+
+      // Fallback: chat-level fields, prefer createdAt over updatedAt
+      // (updatedAt can be inflated by sync operations).
+      const direct =
+        chat?.createdAt ||
+        chat?.created_at ||
+        chat?.created ||
+        chat?.chat?.createdAt ||
+        chat?.chat?.created_at ||
+        chat?.conversation?.createdAt ||
+        chat?.conversation?.created_at ||
+        chat?.updatedAt ||
+        chat?.updated_at ||
+        chat?.lastUpdated ||
+        chat?.modifiedAt ||
+        chat?.timestamp ||
+        chat?.ts ||
+        chat?.chat?.updatedAt ||
+        chat?.chat?.updated_at ||
+        chat?.conversation?.updatedAt ||
+        chat?.conversation?.updated_at ||
+        null;
+      if (direct) return direct;
 
       return null;
     }
@@ -7177,7 +7178,7 @@ async download(key, isMetadata = false) {
                   <div id="archived-chats-filter-count" class="text-xs text-zinc-500"></div>
                 </div>
                 <input id="archived-chats-search" type="text" placeholder="Search by title or chat ID..." class="w-full px-2 py-1.5 mb-1 border border-zinc-600 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 text-xs dark:bg-zinc-700 text-white">
-                <div id="archived-chats-list" class="w-full max-h-48 overflow-y-auto border border-zinc-600 rounded-md bg-zinc-700" style="min-height:40px;"></div>
+                <div id="archived-chats-list" class="w-full max-h-52 overflow-y-auto overflow-x-hidden border border-zinc-600 rounded-md bg-zinc-700" style="min-height:36px;"></div>
                 <div class="flex justify-end gap-2 mt-2">
                   <button id="restore-archived-selected-btn" class="px-2 py-1.5 text-sm text-white bg-green-600 rounded-md hover:bg-green-700 disabled:bg-gray-500 disabled:cursor-not-allowed" disabled>Restore Selected</button>
                   <button id="remove-archived-entry-btn" class="px-2 py-1.5 text-sm text-white bg-red-600 rounded-md hover:bg-red-700 disabled:bg-gray-500 disabled:cursor-not-allowed" disabled>Remove Entry</button>
@@ -7955,32 +7956,59 @@ async download(key, isMetadata = false) {
       if (filterCountEl) {
         filterCountEl.textContent = list.length > 0 ? `${list.length} of ${list.length}` : "";
       }
+      const PAGE_SIZE = 50;
+      this._archivePageIndex = 0;
+      this._archiveFilteredList = list;
+
+      const parseToMs = (value) => {
+        if (typeof value === "number") {
+          return value < 10_000_000_000 ? value * 1000 : value;
+        }
+        if (!value) return 0;
+        const ms = new Date(value).getTime();
+        return Number.isFinite(ms) ? ms : 0;
+      };
+
+      const renderRow = (c) => {
+        const esc = (s) => (s || "").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        const title = esc(c.title) || c.chatId;
+        const updatedAtMs = parseToMs(c.updatedAt);
+        const datePart = updatedAtMs
+          ? new Date(updatedAtMs).toLocaleDateString()
+          : (c.archivedAt ? new Date(c.archivedAt).toLocaleDateString() : "");
+        return `<div class="archived-chat-row flex items-center gap-2 px-2 py-1.5 cursor-pointer hover:bg-zinc-600 text-xs text-zinc-300 border-b border-zinc-600/50" data-chat-id="${c.chatId}" data-search="${esc(c.title).toLowerCase()} ${c.chatId.toLowerCase()}"><span class="shrink-0 text-zinc-500 text-[10px]" style="width:68px">${datePart}</span><span class="min-w-0 truncate flex-1" title="${title}">${title}</span></div>`;
+      };
+      this._archiveRenderRow = renderRow;
+
+      const renderPage = (items, container, startIdx) => {
+        const end = Math.min(startIdx + PAGE_SIZE, items.length);
+        const fragment = document.createRange().createContextualFragment(
+          items.slice(startIdx, end).map(renderRow).join("")
+        );
+        const loadMoreEl = container.querySelector(".archive-load-more");
+        if (loadMoreEl) loadMoreEl.remove();
+        container.appendChild(fragment);
+        if (end < items.length) {
+          const more = document.createElement("div");
+          more.className = "archive-load-more px-2 py-1.5 text-center text-xs text-blue-400 cursor-pointer hover:bg-zinc-600 border-b border-zinc-600/50";
+          more.textContent = `Show more (${end} of ${items.length})`;
+          more.addEventListener("click", (e) => {
+            e.stopPropagation();
+            this._archivePageIndex++;
+            renderPage(items, container, this._archivePageIndex * PAGE_SIZE);
+          });
+          container.appendChild(more);
+        }
+      };
+      this._archiveRenderPage = renderPage;
+
       if (listContainer) {
         if (list.length === 0) {
-          listContainer.innerHTML = `<div class="px-3 py-2 text-xs text-zinc-500">No archived chats</div>`;
+          listContainer.innerHTML = `<div class="px-2 py-2 text-xs text-zinc-500">No archived chats</div>`;
         } else {
-          const parseToMs = (value) => {
-            if (typeof value === "number") {
-              return value < 10_000_000_000 ? value * 1000 : value;
-            }
-            if (!value) return 0;
-            const ms = new Date(value).getTime();
-            return Number.isFinite(ms) ? ms : 0;
-          };
-          listContainer.innerHTML = list
-            .map((c) => {
-              const esc = (s) => (s || "").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-              const title = esc(c.title) || c.chatId;
-              const updatedAtMs = parseToMs(c.updatedAt);
-              const datePart = updatedAtMs
-                ? new Date(updatedAtMs).toLocaleDateString()
-                : (c.archivedAt ? new Date(c.archivedAt).toLocaleDateString() : "");
-              const keys = c.keyCount || 0;
-              return `<div class="archived-chat-row flex items-center gap-2 px-3 py-1.5 cursor-pointer hover:bg-zinc-600 text-xs text-zinc-300 border-b border-zinc-600/50" data-chat-id="${c.chatId}" data-title="${esc(c.title)}" data-search="${esc(c.title).toLowerCase()} ${c.chatId.toLowerCase()}"><span class="shrink-0 text-zinc-500 w-20">${datePart}</span><span class="truncate flex-1" title="${title}">${title}</span><span class="shrink-0 text-zinc-500">${keys ? keys + "k" : ""}</span></div>`;
-            })
-            .join("");
+          listContainer.innerHTML = "";
+          renderPage(list, listContainer, 0);
         }
-        listContainer.querySelector(".archived-chat-row[data-selected]")?.removeAttribute("data-selected");
       }
       if (searchInput) {
         searchInput.value = "";
@@ -8035,23 +8063,37 @@ async download(key, isMetadata = false) {
       }
 
       if (searchInput && listContainer) {
+        let debounceTimer = null;
         const searchHandler = () => {
-          const q = searchInput.value.toLowerCase().trim();
-          const rows = listContainer.querySelectorAll(".archived-chat-row");
-          let visible = 0;
-          rows.forEach((row) => {
-            const haystack = row.getAttribute("data-search") || "";
-            const match = !q || haystack.includes(q);
-            row.style.display = match ? "" : "none";
-            if (match) visible++;
-          });
-          if (filterCountEl) {
-            const total = rows.length;
-            filterCountEl.textContent = total > 0 ? `${visible} of ${total}` : "";
-          }
+          clearTimeout(debounceTimer);
+          debounceTimer = setTimeout(() => {
+            const q = searchInput.value.toLowerCase().trim();
+            const allList = this._archivedChatsList || [];
+            const filtered = q
+              ? allList.filter((c) => {
+                  const hay = ((c.title || "") + " " + c.chatId).toLowerCase();
+                  return hay.includes(q);
+                })
+              : allList;
+            this._archiveFilteredList = filtered;
+            this._archivePageIndex = 0;
+            listContainer.innerHTML = "";
+            if (filtered.length === 0) {
+              listContainer.innerHTML = `<div class="px-2 py-2 text-xs text-zinc-500">${q ? "No matches" : "No archived chats"}</div>`;
+            } else {
+              this._archiveRenderPage(filtered, listContainer, 0);
+            }
+            if (filterCountEl) {
+              filterCountEl.textContent = allList.length > 0 ? `${filtered.length} of ${allList.length}` : "";
+            }
+            this.updateLocalArchiveUIState(modal);
+          }, 200);
         };
         searchInput.addEventListener("input", searchHandler);
-        this.modalCleanupCallbacks.push(() => searchInput.removeEventListener("input", searchHandler));
+        this.modalCleanupCallbacks.push(() => {
+          searchInput.removeEventListener("input", searchHandler);
+          clearTimeout(debounceTimer);
+        });
       }
 
       if (previewBtn) {
