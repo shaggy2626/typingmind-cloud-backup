@@ -21,7 +21,7 @@ Contributors (Docs & Fixes):
 - McQuade (Stability improvements) [2025-12-28]
 */
 
-const TCS_BUILD_VERSION = "2026-03-06.1";
+const TCS_BUILD_VERSION = "2026-03-24.1";
 
 if (window.typingMindCloudSync) {
   console.log("TypingMind Cloud Sync already loaded");
@@ -3246,6 +3246,7 @@ async download(key, isMetadata = false) {
         title: archiveTargets.title,
         updatedAt: archiveTargets.updatedAt,
         keys: archiveTargets.keys,
+        keySummary: archiveTargets.keySummary,
       };
       this.saveLocalArchiveManifest(manifest);
       for (const key of archiveTargets.keys) {
@@ -7163,14 +7164,6 @@ async download(key, isMetadata = false) {
                 <input id="archive-cutoff-date" type="date" value="${cutoffDateDefault}" class="px-2 py-1 border border-zinc-600 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 text-xs dark:bg-zinc-700 text-white">
               </div>
 
-              <div class="flex items-center justify-between gap-2">
-                <label class="text-xs text-zinc-400">Preview scope</label>
-                <select id="archive-preview-scope" class="px-2 py-1 border border-zinc-600 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 text-xs dark:bg-zinc-700 text-white">
-                  <option value="cutoff" selected>Before cutoff date</option>
-                  <option value="all">All chats (any year)</option>
-                </select>
-              </div>
-
               <div class="flex gap-2">
                 <button id="preview-archive-pre2024-btn" class="px-2 py-1.5 text-sm text-white bg-blue-600 rounded-md hover:bg-blue-700 disabled:bg-gray-500 disabled:cursor-not-allowed">Preview</button>
                 <button id="archive-pre2024-btn" class="px-2 py-1.5 text-sm text-white bg-orange-600 rounded-md hover:bg-orange-700 disabled:bg-gray-500 disabled:cursor-not-allowed">Archive Locally</button>
@@ -7185,6 +7178,7 @@ async download(key, isMetadata = false) {
                 </select>
                 <div class="flex justify-end gap-2 mt-2">
                   <button id="restore-archived-selected-btn" class="px-2 py-1.5 text-sm text-white bg-green-600 rounded-md hover:bg-green-700 disabled:bg-gray-500 disabled:cursor-not-allowed" disabled>Restore Selected</button>
+                  <button id="remove-archived-entry-btn" class="px-2 py-1.5 text-sm text-white bg-red-600 rounded-md hover:bg-red-700 disabled:bg-gray-500 disabled:cursor-not-allowed" disabled>Remove Entry</button>
                   <button id="restore-archived-all-btn" class="px-2 py-1.5 text-sm text-white bg-green-600 rounded-md hover:bg-green-700 disabled:bg-gray-500 disabled:cursor-not-allowed" disabled>Restore All</button>
                 </div>
                 <div id="local-archive-restore-status" class="text-xs text-zinc-400 mt-2 whitespace-pre-wrap"></div>
@@ -7909,8 +7903,11 @@ async download(key, isMetadata = false) {
       const previewBtn = modal.querySelector("#preview-archive-pre2024-btn");
       const archiveBtn = modal.querySelector("#archive-pre2024-btn");
       const restoreSelectedBtn = modal.querySelector("#restore-archived-selected-btn");
+      const removeEntryBtn = modal.querySelector("#remove-archived-entry-btn");
       const restoreAllBtn = modal.querySelector("#restore-archived-all-btn");
       const isConfigured = !!this.storageService?.isConfigured();
+      const select = modal.querySelector("#archived-chats-select");
+      const hasSelection = !!select?.value;
       if (previewBtn) {
         previewBtn.disabled = false;
       }
@@ -7918,9 +7915,11 @@ async download(key, isMetadata = false) {
         archiveBtn.disabled = this.noSyncMode || !isConfigured;
       }
       if (restoreSelectedBtn) {
-        const select = modal.querySelector("#archived-chats-select");
         restoreSelectedBtn.disabled =
-          this.noSyncMode || !isConfigured || !select?.value;
+          this.noSyncMode || !isConfigured || !hasSelection;
+      }
+      if (removeEntryBtn) {
+        removeEntryBtn.disabled = !hasSelection;
       }
       if (restoreAllBtn) {
         const list = this.syncOrchestrator?.getArchivedChatsList?.() || [];
@@ -7985,10 +7984,10 @@ async download(key, isMetadata = false) {
       const previewBtn = modal.querySelector("#preview-archive-pre2024-btn");
       const archiveBtn = modal.querySelector("#archive-pre2024-btn");
       const previewOut = modal.querySelector("#local-archive-preview");
-      const previewScope = modal.querySelector("#archive-preview-scope");
       const cutoffDateInput = modal.querySelector("#archive-cutoff-date");
       const select = modal.querySelector("#archived-chats-select");
       const restoreSelectedBtn = modal.querySelector("#restore-archived-selected-btn");
+      const removeEntryBtn = modal.querySelector("#remove-archived-entry-btn");
       const restoreAllBtn = modal.querySelector("#restore-archived-all-btn");
       const restoreStatus = modal.querySelector("#local-archive-restore-status");
 
@@ -8019,27 +8018,22 @@ async download(key, isMetadata = false) {
           previewBtn.textContent = "Working...";
           if (previewOut) previewOut.textContent = "Calculating…";
           try {
-            const scope = previewScope?.value || "cutoff";
             const dateStr = cutoffDateInput?.value || localStorage.getItem("tcs_archive_cutoff_date") || "";
             const cutoffMs = dateStr ? new Date(`${dateStr}T00:00:00`).getTime() : 0;
-            const result =
-              scope === "all"
-                ? await this.syncOrchestrator.previewArchiveAllChats()
-                : await this.syncOrchestrator.previewArchiveBeforeTimestamp(cutoffMs);
+            if (!cutoffMs) {
+              if (previewOut) previewOut.textContent = "Please pick a cutoff date first.";
+              return;
+            }
+            const result = await this.syncOrchestrator.previewArchiveBeforeTimestamp(cutoffMs);
             if (previewOut) {
-              const scopeLabel = scope === "all"
-                ? "ALL chats"
-                : (dateStr ? `before ${dateStr}` : "before cutoff date");
               previewOut.textContent =
-                `Scope: ${scopeLabel}\n` +
+                `Scope: before ${dateStr}\n` +
                 `Chats (candidates): ${result.candidateChatCount}\n` +
                 `Chats archivable now: ${result.archivableChatCount}\n` +
                 `Local keys to remove: ${result.totalKeysToRemove}\n` +
                 `- Blobs: ${result.blobCount}\n` +
                 `- Client cache: ${result.cacheCount}\n` +
-                (scope === "all"
-                  ? ""
-                  : `\nDate coverage:\n- Total chats seen: ${result.totalChatCount}\n- Chats with unknown date: ${result.undatedChatCount}\n`) +
+                `\nDate coverage:\n- Total chats seen: ${result.totalChatCount}\n- Chats with unknown date: ${result.undatedChatCount}\n` +
                 `\nLocal totals (all data, for sanity):\n` +
                 `- Total BLOB_* keys: ${result.localBlobKeyCount}\n` +
                 `- Total CLIENT_CACHE_attachment-* keys: ${result.localClientCacheKeyCount}\n`;
@@ -8144,6 +8138,31 @@ async download(key, isMetadata = false) {
         restoreSelectedBtn.addEventListener("click", handler);
         this.modalCleanupCallbacks.push(() =>
           restoreSelectedBtn.removeEventListener("click", handler)
+        );
+      }
+
+      if (removeEntryBtn) {
+        const handler = (e) => {
+          e.stopPropagation();
+          const chatId = select?.value;
+          if (!chatId) return;
+          if (
+            !confirm(
+              `Remove this chat from the archive list?\n\n${chatId}\n\nThis does NOT delete it from cloud — it just stops tracking it as archived. You won't be able to restore it from this list anymore.\n\nContinue?`
+            )
+          ) {
+            return;
+          }
+          const manifest = this.syncOrchestrator.loadLocalArchiveManifest();
+          delete manifest.chats[chatId];
+          this.syncOrchestrator.saveLocalArchiveManifest(manifest);
+          if (restoreStatus) restoreStatus.textContent = `Removed archive entry: ${chatId}`;
+          this.loadLocalArchiveSection(modal);
+          this.updateLocalArchiveUIState(modal);
+        };
+        removeEntryBtn.addEventListener("click", handler);
+        this.modalCleanupCallbacks.push(() =>
+          removeEntryBtn.removeEventListener("click", handler)
         );
       }
 
